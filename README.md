@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ AETHER DOWNLOAD ACCELERATOR
+#  AETHER DOWNLOAD ACCELERATOR
 
 **Acelerador de descargas concurrente multiplataforma de alta velocidad con interfaz translúcida de Glassmorphism.**
 
@@ -18,29 +18,29 @@ Aether es una alternativa de código abierto a programas privativos como Interne
 
 ---
 
-## ✨ Características Principales
+##  Características Principales
 
-*   🚀 **Segmentación Dinámica Concurrente**: Conexiones simultáneas paralelas (de 1 a 32 hilos). Cuando un hilo termina anticipadamente, **subdivide automáticamente** los fragmentos más rezagados para mantener el 100% de saturación de red hasta el último byte (algoritmo inteligente estilo IDM).
-*   💎 **Interfaz Glassmorphism de Alta Gama**: Paneles translúcidos con `backdrop-filter: blur(28px)`, bordes de cristal biselados y resplandor interno en fondo oscuro puro (`#040408`).
-*   🎛️ **3 Diales de Tema en Vivo (*Impeccable Design*)**:
+*    **Segmentación Dinámica Concurrente**: Conexiones simultáneas paralelas (de 1 a 32 hilos). Cuando un hilo termina anticipadamente, **subdivide automáticamente** los fragmentos más rezagados para mantener el 100% de saturación de red hasta el último byte (algoritmo inteligente estilo IDM).
+*    **Interfaz Glassmorphism de Alta Gama**: Paneles translúcidos con `backdrop-filter: blur(28px)`, bordes de cristal biselados y resplandor interno en fondo oscuro puro (`#040408`).
+*    **3 Diales de Tema en Vivo (*Impeccable Design*)**:
     1.  **Obsidian Glass**: Fondo ultra oscuro con acentos cian y violeta cuántico.
     2.  **Cyber Neon**: Flúor magenta con alto contraste y resplandor eléctrico.
     3.  **OLED Frost**: Monocromo minimalista puro (negro absoluto y blanco hielo).
-*   📊 **Visualizador Matricial de Segmentos en Vivo**: Inspecciona en tiempo real el progreso de cada hilo TCP individual, su velocidad en MB/s y sus rangos de bytes.
-*   📈 **Velocímetro SVG Reactivo (Sparkline)**: Gráfica fluida de ancho de banda global transmitida por WebSockets cada 100ms.
-*   🛡️ **Cero Regresiones & TDD**: Desarrollado bajo la disciplina estricta del **Clan Tortugas Ninja & Maestro Splinter** con verificación obligatoria de sumas de comprobación SHA-256 e integridad byte-a-byte.
-*   💾 **Pre-asignación Zero-Wait en Disco**: Escritura no bloqueante directa con `seek` y pre-dimensionamiento para prevenir la fragmentación de archivos en Linux (ext4/btrfs) y Windows (NTFS).
-*   ⏸️ **Pausa y Reanudación Real**: Almacena el estado de los bloques en archivos `.aether.json` para continuar descargas interrumpidas en cualquier momento.
+*    **Visualizador Matricial de Segmentos en Vivo**: Inspecciona en tiempo real el progreso de cada hilo TCP individual, su velocidad en MB/s y sus rangos de bytes.
+*    **Velocímetro SVG Reactivo (Sparkline)**: Gráfica fluida de ancho de banda global transmitida por WebSockets cada 100ms.
+*    **Cero Regresiones & TDD**: Desarrollado bajo la disciplina estricta del **Clan Tortugas Ninja & Maestro Splinter** con verificación obligatoria de sumas de comprobación SHA-256 e integridad byte-a-byte.
+*    **Pre-asignación Zero-Wait en Disco**: Escritura no bloqueante directa con `seek` y pre-dimensionamiento para prevenir la fragmentación de archivos en Linux (ext4/btrfs) y Windows (NTFS).
+*   **Pausa y Reanudación Real**: Almacena el estado de los bloques en archivos `.aether.json` para continuar descargas interrumpidas en cualquier momento.
 
 ---
 
-## 🖥️ Plataformas Soportadas
+##  Plataformas Soportadas
 
 | Sistema Operativo | Modo de Ventana | Integración |
 | :--- | :--- | :--- |
-| 🐧 **Linux** (CachyOS, Arch, Ubuntu, Fedora) | Wayland / X11 | Ventana flotante con soporte nativo de transparencia en Hyprland, Sway, GNOME, KDE. |
-| 🪟 **Windows** (10, 11) | Ventana Nativa | Lanzamiento automático en ventana de aplicación independiente vía Edge / Chrome / Brave. |
-| 🍎 **macOS** (Apple Silicon / Intel) | App Mode | Lanzamiento optimizado en Brave, Chrome o Safari. |
+|  **Linux** (CachyOS, Arch, Ubuntu, Fedora) | Wayland / X11 | Ventana flotante con soporte nativo de transparencia en Hyprland, Sway, GNOME, KDE. |
+|  **Windows** (10, 11) | Ventana Nativa | Lanzamiento automático en ventana de aplicación independiente vía Edge / Chrome / Brave. |
+|  **macOS** (Apple Silicon / Intel) | App Mode | Lanzamiento optimizado en Brave, Chrome o Safari. |
 
 ---
 
@@ -72,7 +72,7 @@ Descarga el ejecutable para tu plataforma desde la sección de **[Releases](http
 
 ---
 
-## 🪟 Configuración en Hyprland (Linux)
+##  Configuración en Hyprland (Linux)
 
 Para que Aether se abra como una ventana flotante translúcida y con desenfoque automático en Hyprland, añade las siguientes reglas a tu `~/.config/hypr/hyprland.conf`:
 
@@ -85,7 +85,7 @@ windowrulev2 = opacity 0.88 0.88, class:^(AetherAccelerator)$
 
 ---
 
-## 🧪 Suite de Pruebas Automatizadas (TDD)
+##  Suite de Pruebas Automatizadas (TDD)
 
 El proyecto incluye pruebas integrales que verifican la matemática de segmentación, particionado dinámico de hilos, persistencia de estado y validación de hash SHA-256 contra un servidor HTTP mock:
 
@@ -142,15 +142,6 @@ aether-accelerator/
 
 ---
 
-## 🐢 Squad de Ingeniería
-
-*   🐢 **Leonardo**: Arquitectura UI/UX Glassmorphism y layout responsivo con escala áurea.
-*   🐢 **Donatello**: Motor asíncrono, algoritmos de segmentación y gestión de sockets TCP.
-*   🐀 **Maestro Splinter**: Seguridad, sanitización de rutas y validación de sumas de verificación.
-*   🐢 **Raphael**: QA, TDD y pruebas de resiliencia ante cortes y reconexión.
-*   🐢 **Michelangelo**: Micro-interacciones, efectos visuales de flujo de datos y diales de color.
-
----
 
 ## 📄 Licencia
 

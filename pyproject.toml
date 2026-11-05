@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aether-accelerator"
+version = "1.0.0"
+authors = [
+  { name = "Alejandro11R" }
+]
+description = "High-speed multi-threaded download accelerator with translucent glassmorphism UI for Linux, Windows and macOS."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Communications :: File Sharing",
+]
+dependencies = [
+    "aiohttp>=3.9.0",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/Alejandro11R/aether-accelerator"
+"Bug Tracker" = "https://github.com/Alejandro11R/aether-accelerator/issues"
+
+[project.scripts]
+aether = "run:main"

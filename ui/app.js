@@ -47,6 +47,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const inputDir = document.getElementById("input-dir");
   const quickFolders = document.getElementById("quick-folders");
   const selectThreads = document.getElementById("select-threads");
+  const selectSpeedLimit = document.getElementById("select-speed-limit");
   const btnPaste = document.getElementById("btn-paste");
 
   let defaultDownloadDir = "";
@@ -405,6 +406,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!url) return;
 
     const threads = parseInt(selectThreads.value, 10);
+    const speedLimit = parseInt(selectSpeedLimit.value, 10);
     const filename = inputFilename.value.trim();
     const customDir = inputDir.value.trim();
 
@@ -416,7 +418,13 @@ document.addEventListener("DOMContentLoaded", () => {
       const resp = await fetch("/api/downloads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, threads, filename, dir: customDir })
+        body: JSON.stringify({
+          url,
+          threads,
+          filename,
+          dir: customDir,
+          speed_limit_bps: speedLimit
+        })
       });
       const data = await resp.json();
       if (data.success) {

@@ -45,12 +45,14 @@ def create_app(download_dir: str, ui_dir: str) -> web.Application:
         threads = int(body.get("threads", 8))
         filename = body.get("filename", "").strip() or None
         custom_dir = body.get("dir", "").strip() or None
+        speed_limit = int(body.get("speed_limit_bps", 0))
 
         task = await manager.add_download(
             url=url,
             threads=threads,
             filename=filename,
-            output_dir=custom_dir
+            output_dir=custom_dir,
+            speed_limit_bps=speed_limit
         )
         return web.json_response({"success": True, "task": task.to_dict()})
 
@@ -63,6 +65,16 @@ def create_app(download_dir: str, ui_dir: str) -> web.Application:
         task_id = request.match_info["id"]
         success = await manager.resume_download(task_id)
         return web.json_response({"success": success})
+
+    async def set_limit(request):
+        task_id = request.match_info["id"]
+        try:
+            body = await request.json()
+            limit_bps = int(body.get("limit_bps", 0))
+            success = await manager.set_speed_limit(task_id, limit_bps)
+            return web.json_response({"success": success})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=400)
 
     async def delete_download(request):
         task_id = request.match_info["id"]
@@ -116,6 +128,7 @@ def create_app(download_dir: str, ui_dir: str) -> web.Application:
     app.router.add_post("/api/downloads", add_download)
     app.router.add_post("/api/downloads/{id}/pause", pause_download)
     app.router.add_post("/api/downloads/{id}/resume", resume_download)
+    app.router.add_post("/api/downloads/{id}/limit", set_limit)
     app.router.add_delete("/api/downloads/{id}", delete_download)
     app.router.add_get("/api/system", get_system_info)
     app.router.add_get("/ws", websocket_handler)

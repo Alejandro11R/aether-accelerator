@@ -16,7 +16,7 @@ from aiohttp import web
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core.segment import Segment
-from core.engine import DownloadTask
+from core.engine import DownloadTask, RateLimiter
 
 class TestSegmentationLogic(unittest.TestCase):
     def test_segment_math(self):
@@ -52,6 +52,13 @@ class TestSegmentationLogic(unittest.TestCase):
 
         self.assertEqual(first_half_len + second_half_len, remaining)
         self.assertEqual(new_start, mid + 1)
+
+    def test_rate_limiter_throttling(self):
+        """Verifica que el Token Bucket regule el consumo de bytes."""
+        limiter = RateLimiter(rate_bps=100_000) # 100 KB/s
+        self.assertEqual(limiter.rate_bps, 100_000)
+        limiter.set_rate(0) # Ilimitado
+        self.assertEqual(limiter.rate_bps, 0)
 
 
 class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):

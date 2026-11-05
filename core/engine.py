@@ -18,6 +18,36 @@ from core.segment import Segment
 MIN_SPLIT_CHUNK = 2 * 1024 * 1024  # 2MB mínimo para dividir un segmento
 BUFFER_SIZE = 64 * 1024            # 64KB por paquete de lectura
 
+class RateLimiter:
+    """Implementación Token Bucket para limitar el ancho de banda sin jitter."""
+    def __init__(self, rate_bps: int = 0):
+        self.rate_bps = max(0, rate_bps)
+        self.allowance = float(self.rate_bps)
+        self.last_check = time.time()
+        self._lock = asyncio.Lock()
+
+    def set_rate(self, rate_bps: int):
+        self.rate_bps = max(0, rate_bps)
+        self.allowance = float(self.rate_bps)
+
+    async def consume(self, amount: int):
+        if self.rate_bps <= 0:
+            return
+        async with self._lock:
+            now = time.time()
+            elapsed = now - self.last_check
+            self.last_check = now
+            self.allowance += elapsed * self.rate_bps
+            if self.allowance > self.rate_bps:
+                self.allowance = float(self.rate_bps)
+            if self.allowance < amount:
+                deficit = amount - self.allowance
+                delay = deficit / self.rate_bps
+                self.allowance = 0.0
+                await asyncio.sleep(min(delay, 2.0))
+            else:
+                self.allowance -= amount
+
 class DownloadTask:
     def __init__(
         self,
@@ -26,6 +56,7 @@ class DownloadTask:
         output_dir: str,
         custom_filename: Optional[str] = None,
         connections: int = 8,
+        speed_limit_bps: int = 0,
         on_update: Optional[Callable] = None
     ):
         self.task_id = task_id
@@ -33,6 +64,8 @@ class DownloadTask:
         self.output_dir = output_dir
         self.custom_filename = custom_filename
         self.connections = max(1, min(connections, 32))
+        self.speed_limit_bps = speed_limit_bps
+        self.rate_limiter = RateLimiter(speed_limit_bps)
         self.on_update = on_update
 
         self.filename = custom_filename or "download.bin"
@@ -301,6 +334,7 @@ class DownloadTask:
                         chunk_len = len(chunk)
                         segment.update_progress(chunk_len)
                         self.bytes_downloaded += chunk_len
+                        await self.rate_limiter.consume(chunk_len)
 
                     if segment.current_byte > segment.end_byte:
                         segment.status = "completed"
@@ -366,6 +400,7 @@ class DownloadTask:
                     chunk_len = len(chunk)
                     seg.update_progress(chunk_len)
                     self.bytes_downloaded += chunk_len
+                    await self.rate_limiter.consume(chunk_len)
                     
         seg.status = "completed"
 
@@ -388,6 +423,10 @@ class DownloadTask:
                 except Exception:
                     pass
 
+    def set_speed_limit(self, limit_bps: int):
+        self.speed_limit_bps = max(0, limit_bps)
+        self.rate_limiter.set_rate(self.speed_limit_bps)
+
     async def pause(self):
         """Pausa la descarga de forma limpia."""
         self._stop_event.set()
@@ -407,6 +446,7 @@ class DownloadTask:
             "bytes_downloaded": self.bytes_downloaded,
             "progress": round(self.progress_percentage, 1),
             "speed_bps": round(self.speed_bps),
+            "speed_limit_bps": self.speed_limit_bps,
             "eta_seconds": self.eta_seconds,
             "status": self.status,
             "supports_range": self.supports_range,

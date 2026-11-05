@@ -37,7 +37,8 @@ class QueueManager:
         url: str,
         threads: int = 8,
         filename: Optional[str] = None,
-        output_dir: Optional[str] = None
+        output_dir: Optional[str] = None,
+        speed_limit_bps: int = 0
     ) -> DownloadTask:
         task_id = str(uuid.uuid4())[:8]
         target_dir = os.path.abspath(os.path.expanduser(output_dir)) if output_dir else self.download_dir
@@ -49,6 +50,7 @@ class QueueManager:
             output_dir=target_dir,
             custom_filename=filename,
             connections=threads,
+            speed_limit_bps=speed_limit_bps,
             on_update=self._on_task_update
         )
         self.tasks[task_id] = task
@@ -69,6 +71,13 @@ class QueueManager:
 
     async def _on_task_update(self, task_dict: dict):
         await self.broadcast({"type": "task_progress", "task": task_dict})
+
+    async def set_speed_limit(self, task_id: str, limit_bps: int) -> bool:
+        if task_id in self.tasks:
+            self.tasks[task_id].set_speed_limit(limit_bps)
+            await self.broadcast({"type": "task_updated", "task": self.tasks[task_id].to_dict()})
+            return True
+        return False
 
     async def pause_download(self, task_id: str) -> bool:
         if task_id in self.tasks:

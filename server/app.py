@@ -44,8 +44,14 @@ def create_app(download_dir: str, ui_dir: str) -> web.Application:
 
         threads = int(body.get("threads", 8))
         filename = body.get("filename", "").strip() or None
+        custom_dir = body.get("dir", "").strip() or None
 
-        task = await manager.add_download(url=url, threads=threads, filename=filename)
+        task = await manager.add_download(
+            url=url,
+            threads=threads,
+            filename=filename,
+            output_dir=custom_dir
+        )
         return web.json_response({"success": True, "task": task.to_dict()})
 
     async def pause_download(request):

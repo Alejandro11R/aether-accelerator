@@ -32,12 +32,21 @@ class QueueManager:
             except Exception:
                 pass
 
-    async def add_download(self, url: str, threads: int = 8, filename: Optional[str] = None) -> DownloadTask:
+    async def add_download(
+        self,
+        url: str,
+        threads: int = 8,
+        filename: Optional[str] = None,
+        output_dir: Optional[str] = None
+    ) -> DownloadTask:
         task_id = str(uuid.uuid4())[:8]
+        target_dir = os.path.abspath(os.path.expanduser(output_dir)) if output_dir else self.download_dir
+        os.makedirs(target_dir, exist_ok=True)
+        
         task = DownloadTask(
             task_id=task_id,
             url=url,
-            output_dir=self.download_dir,
+            output_dir=target_dir,
             custom_filename=filename,
             connections=threads,
             on_update=self._on_task_update

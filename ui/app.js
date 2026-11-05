@@ -44,8 +44,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const formNewDownload = document.getElementById("form-new-download");
   const inputUrl = document.getElementById("input-url");
   const inputFilename = document.getElementById("input-filename");
+  const inputDir = document.getElementById("input-dir");
+  const quickFolders = document.getElementById("quick-folders");
   const selectThreads = document.getElementById("select-threads");
   const btnPaste = document.getElementById("btn-paste");
+
+  let defaultDownloadDir = "";
 
   // --- 1. GESTOR DE TEMAS DIAL (IMPECCABLE DESIGN) ---
   const savedTheme = localStorage.getItem("aether-theme") || "obsidian";
@@ -101,7 +105,13 @@ document.addEventListener("DOMContentLoaded", () => {
   function handleWsMessage(msg) {
     if (msg.type === "init") {
       downloads = msg.downloads || [];
-      if (msg.download_dir) downloadDirTextEl.textContent = msg.download_dir;
+      if (msg.download_dir) {
+        defaultDownloadDir = msg.download_dir;
+        downloadDirTextEl.textContent = msg.download_dir;
+        if (!inputDir.value) {
+          inputDir.value = localStorage.getItem("aether-dir") || defaultDownloadDir;
+        }
+      }
       if (!selectedTaskId && downloads.length > 0) {
         selectedTaskId = downloads[0].id;
       }
@@ -354,6 +364,9 @@ document.addEventListener("DOMContentLoaded", () => {
   btnOpenModal.addEventListener("click", () => {
     modalNewDownload.classList.add("open");
     inputUrl.focus();
+    if (!inputDir.value) {
+      inputDir.value = localStorage.getItem("aether-dir") || defaultDownloadDir;
+    }
     // Auto-detectar URL en portapapeles
     if (navigator.clipboard && navigator.clipboard.readText) {
       navigator.clipboard.readText().then(text => {
@@ -380,6 +393,12 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  quickFolders.addEventListener("change", () => {
+    if (quickFolders.value) {
+      inputDir.value = quickFolders.value;
+    }
+  });
+
   formNewDownload.addEventListener("submit", async (e) => {
     e.preventDefault();
     const url = inputUrl.value.trim();
@@ -387,12 +406,17 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const threads = parseInt(selectThreads.value, 10);
     const filename = inputFilename.value.trim();
+    const customDir = inputDir.value.trim();
+
+    if (customDir) {
+      localStorage.setItem("aether-dir", customDir);
+    }
 
     try {
       const resp = await fetch("/api/downloads", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, threads, filename })
+        body: JSON.stringify({ url, threads, filename, dir: customDir })
       });
       const data = await resp.json();
       if (data.success) {

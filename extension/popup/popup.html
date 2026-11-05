@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aether Integration</title>
+  <link rel="stylesheet" href="popup.css">
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div class="popup-container">
+    <div class="popup-header">
+      <div class="brand">
+        <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+        </svg>
+        <span class="brand-title">AETHER</span>
+      </div>
+      <span class="badge-tag">v1.0</span>
+    </div>
+
+    <div class="status-card" id="status-card">
+      <div class="status-left">
+        <span class="status-dot" id="status-dot"></span>
+        <div>
+          <div class="status-label" id="status-label">Verificando motor...</div>
+          <div class="status-sub" id="status-sub">127.0.0.1</div>
+        </div>
+      </div>
+      <button class="btn-refresh" id="btn-refresh" title="Reconectar">↻</button>
+    </div>
+
+    <div class="control-group">
+      <label class="toggle-row">
+        <span>Captura automática de descargas</span>
+        <input type="checkbox" id="toggle-intercept" checked>
+        <span class="switch-slider"></span>
+      </label>
+    </div>
+
+    <div class="control-row">
+      <span class="control-label">Conexiones paralelas</span>
+      <select id="select-threads" class="threads-select font-mono">
+        <option value="4">4 Hilos</option>
+        <option value="8" selected>8 Hilos</option>
+        <option value="16">16 Hilos</option>
+        <option value="32">32 Hilos</option>
+      </select>
+    </div>
+
+    <div class="popup-actions">
+      <button class="btn-dashboard" id="btn-open-dashboard">
+        Abrir Panel de Control
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+          <polyline points="15 3 21 3 21 9"></polyline>
+          <line x1="10" y1="14" x2="21" y2="3"></line>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

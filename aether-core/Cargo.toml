@@ -1,0 +1,16 @@
+[package]
+name = "aether-core"
+version = "1.0.0"
+edition = "2021"
+authors = ["Alejandro11R"]
+description = "High-speed multi-threaded download engine in pure Rust with dynamic chunk segmentation."
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }

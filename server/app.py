@@ -6,10 +6,13 @@ aiohttp.web con streaming WebSocket de baja latencia (100ms) y endpoints REST.
 import os
 import re
 import json
-from typing import Optional, Set, Tuple
+import platform
+import subprocess
+from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from aiohttp import web, WSMsgType, WSCloseCode
 from core.manager import QueueManager
+from core.security import validate_output_dir
 
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 ALLOWED_EXTENSION_SCHEMES = frozenset({"chrome-extension", "moz-extension"})
@@ -136,12 +139,97 @@ def _parse_int_param(
     return value
 
 
+def _get_platform_key() -> str:
+    """Mapea el sistema operativo actual a 'windows', 'darwin' o 'linux'."""
+    system_name = platform.system().lower()
+    if system_name.startswith("win"):
+        return "windows"
+    if system_name == "darwin":
+        return "darwin"
+    return "linux"
+
+
+def _normalize_quick_folder_key(path: str) -> str:
+    """Normaliza una ruta para deduplicar entradas equivalentes en quick_folders."""
+    return os.path.normcase(os.path.realpath(os.path.abspath(os.path.expanduser(path))))
+
+
+def _pick_linux_quick_path(candidates: List[str]) -> str:
+    """Elige el primer subdirectorio de usuario existente en Linux o el respaldo estándar."""
+    for candidate in candidates:
+        if os.path.isdir(os.path.expanduser(candidate)):
+            return candidate
+    return candidates[-1]
+
+
+def _get_quick_folders(download_dir: str) -> List[Dict[str, str]]:
+    """Construye la lista de rutas rápidas multiplataforma preservando Carpeta Aether primero."""
+    current_platform = _get_platform_key()
+    folders: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def _append_unique(label: str, path: str) -> None:
+        if not path:
+            return
+        normalized = _normalize_quick_folder_key(path)
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        folders.append({"label": label, "path": path})
+
+    _append_unique("Carpeta Aether", download_dir)
+
+    if current_platform == "windows":
+        candidates = [
+            ("Descargas", "~/Downloads"),
+            ("Vídeos", "~/Videos"),
+            ("Documentos", "~/Documents"),
+            ("Escritorio", "~/Desktop"),
+        ]
+    elif current_platform == "darwin":
+        candidates = [
+            ("Descargas", "~/Downloads"),
+            ("Películas", "~/Movies"),
+            ("Documentos", "~/Documents"),
+            ("Escritorio", "~/Desktop"),
+        ]
+    else:
+        candidates = [
+            ("Descargas", _pick_linux_quick_path(["~/Descargas", "~/Downloads"])),
+            ("Vídeos", _pick_linux_quick_path(["~/Vídeos", "~/Videos"])),
+            ("Documentos", _pick_linux_quick_path(["~/Documentos", "~/Documents"])),
+            ("Escritorio", _pick_linux_quick_path(["~/Escritorio", "~/Desktop"])),
+        ]
+
+    for label, path in candidates:
+        _append_unique(label, path)
+
+    return folders
+
+
+def _open_folder_native(path: str) -> None:
+    """Abre un directorio en el explorador de archivos nativo del SO sin shell."""
+    current_platform = _get_platform_key()
+    if current_platform == "windows":
+        os.startfile(path)  # type: ignore[attr-defined]
+    elif current_platform == "darwin":
+        subprocess.Popen(["open", path])
+    else:
+        subprocess.Popen(
+            ["xdg-open", path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def create_app(
     download_dir: str,
     ui_dir: str,
     allowed_hosts: Optional[Set[str]] = None,
+    folder_opener: Optional[Callable[[str], None]] = None,
 ) -> web.Application:
     valid_hosts = _normalize_allowed_hosts(allowed_hosts)
+    opener = folder_opener if folder_opener is not None else _open_folder_native
 
     @web.middleware
     async def security_middleware(request: web.Request, handler):
@@ -172,7 +260,9 @@ def create_app(
                 return web.json_response({"error": "Petición cross-site bloqueada"}, status=403)
 
         if request.method == "POST" and (
-            request.path == "/api/downloads" or _LIMIT_PATH_RE.match(request.path)
+            request.path == "/api/downloads"
+            or request.path == "/api/system/open-folder"
+            or _LIMIT_PATH_RE.match(request.path)
         ):
             if request.content_type != "application/json":
                 return web.json_response(
@@ -288,8 +378,35 @@ def create_app(
             "total_speed_bps": total_speed,
             "active_tasks": active_count,
             "total_tasks": len(downloads),
-            "download_dir": manager.download_dir
+            "download_dir": manager.download_dir,
+            "platform": _get_platform_key(),
+            "quick_folders": _get_quick_folders(manager.download_dir),
         })
+
+    async def open_folder(request):
+        body = await _read_json_dict(request)
+        if body is None:
+            return web.json_response({"error": "Payload JSON inválido"}, status=400)
+
+        raw_dir = body.get("dir")
+        if raw_dir is not None and not isinstance(raw_dir, str):
+            return web.json_response({"error": "Directorio de destino inválido"}, status=400)
+        requested_dir = raw_dir.strip() or None if raw_dir is not None else None
+
+        try:
+            target_dir = validate_output_dir(requested_dir, manager.download_dir)
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+
+        if not os.path.isdir(target_dir):
+            return web.json_response({"error": "El directorio especificado no existe"}, status=400)
+
+        try:
+            opener(target_dir)
+        except Exception as e:
+            return web.json_response({"error": f"No se pudo abrir la carpeta: {e}"}, status=500)
+
+        return web.json_response({"success": True, "path": target_dir})
 
     # --- WebSocket Handler ---
     async def websocket_handler(request):
@@ -301,7 +418,9 @@ def create_app(
         await ws.send_json({
             "type": "init",
             "downloads": manager.get_all(),
-            "download_dir": manager.download_dir
+            "download_dir": manager.download_dir,
+            "platform": _get_platform_key(),
+            "quick_folders": _get_quick_folders(manager.download_dir),
         })
 
         try:
@@ -342,6 +461,7 @@ def create_app(
     app.router.add_post("/api/downloads/{id}/limit", set_limit)
     app.router.add_delete("/api/downloads/{id}", delete_download)
     app.router.add_get("/api/system", get_system_info)
+    app.router.add_post("/api/system/open-folder", open_folder)
     app.router.add_get("/ws", websocket_handler)
 
     # Servir UI estática

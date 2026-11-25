@@ -7,6 +7,7 @@ validación de entradas REST, listado /static y confinamiento en QueueManager.
 import os
 import sys
 import asyncio
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -16,7 +17,9 @@ from aiohttp.test_utils import AioHTTPTestCase
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import server.app as server_app
 from core.manager import QueueManager
+from core.security import validate_output_dir
 from server.app import MANAGER_KEY, WEBSOCKETS_KEY, create_app
 
 
@@ -92,7 +95,13 @@ class TestServerSecurity(AioHTTPTestCase):
         mock_port = site._server.sockets[0].getsockname()[1]
         self.mock_url = f"http://127.0.0.1:{mock_port}/test.bin"
 
-        return create_app(download_dir=self.download_dir, ui_dir=self.ui_dir)
+        return create_app(
+            download_dir=self.download_dir,
+            ui_dir=self.ui_dir,
+            folder_opener=lambda path: self.fail(
+                f"Unexpected folder_opener call in TestServerSecurity: {path}"
+            ),
+        )
 
     async def tearDownAsync(self) -> None:
         manager = self.app.get(MANAGER_KEY)
@@ -234,6 +243,20 @@ class TestServerSecurity(AioHTTPTestCase):
         resp_sys_cs = await self.client.get("/api/system", headers=cross_site_headers)
         self.assertEqual(resp_sys_cs.status, 403)
 
+        resp_open_evil = await self.client.post(
+            "/api/system/open-folder",
+            json={},
+            headers=evil_headers,
+        )
+        self.assertEqual(resp_open_evil.status, 403)
+
+        resp_open_cs = await self.client.post(
+            "/api/system/open-folder",
+            json={},
+            headers=cross_site_headers,
+        )
+        self.assertEqual(resp_open_cs.status, 403)
+
         resp_dup_origin = await self.client.get(
             "/api/system",
             headers=[
@@ -269,6 +292,13 @@ class TestServerSecurity(AioHTTPTestCase):
             headers={"Content-Type": "text/plain"},
         )
         self.assertEqual(resp_limit.status, 415)
+
+        resp_open_folder = await self.client.post(
+            "/api/system/open-folder",
+            data="{}",
+            headers={"Content-Type": "text/plain"},
+        )
+        self.assertEqual(resp_open_folder.status, 415)
 
         # UI pause/resume send POST without body or Content-Type header
         resp_pause = await self.client.post(
@@ -443,6 +473,41 @@ class TestServerSecurity(AioHTTPTestCase):
         resp_escape_del = await self.client.delete(f"/api/downloads/{task_id}?delete_file=true")
         self.assertEqual(resp_escape_del.status, 400)
         self.assertTrue(os.path.exists(outside_file))
+
+    async def test_system_info_and_ws_init_include_platform_and_quick_folders(self):
+        loopback_origin = f"http://127.0.0.1:{self.server.port}"
+        resp_sys = await self.client.get("/api/system", headers={"Origin": loopback_origin})
+        self.assertEqual(resp_sys.status, 200)
+        sys_data = await resp_sys.json()
+
+        for expected_key in ("total_speed_bps", "active_tasks", "total_tasks", "download_dir"):
+            self.assertIn(expected_key, sys_data)
+        self.assertEqual(sys_data["download_dir"], self.download_dir)
+        self.assertIn(sys_data.get("platform"), {"linux", "windows", "darwin"})
+
+        quick_folders = sys_data.get("quick_folders")
+        self.assertIsInstance(quick_folders, list)
+        self.assertGreater(len(quick_folders), 0)
+        self.assertEqual(
+            quick_folders[0],
+            {"label": "Carpeta Aether", "path": self.download_dir},
+        )
+        for item in quick_folders:
+            self.assertIsInstance(item, dict)
+            self.assertIsInstance(item.get("label"), str)
+            self.assertTrue(item["label"])
+            self.assertIsInstance(item.get("path"), str)
+            self.assertTrue(item["path"])
+            validate_output_dir(item["path"], self.download_dir)
+
+        async with self.client.ws_connect("/ws", headers={"Origin": loopback_origin}) as ws:
+            init_msg = await ws.receive_json(timeout=2.0)
+
+        self.assertEqual(init_msg.get("type"), "init")
+        self.assertIsInstance(init_msg.get("downloads"), list)
+        self.assertEqual(init_msg.get("download_dir"), self.download_dir)
+        self.assertEqual(init_msg.get("platform"), sys_data["platform"])
+        self.assertEqual(init_msg.get("quick_folders"), quick_folders)
 
 
 class TestCustomAllowedHosts(AioHTTPTestCase):
@@ -696,6 +761,296 @@ class TestServerShutdown(unittest.IsolatedAsyncioTestCase):
             finally:
                 app[WEBSOCKETS_KEY].discard(broken_ws)
                 await runner.cleanup()
+
+
+class TestSystemOpenFolder(AioHTTPTestCase):
+    async def get_application(self) -> web.Application:
+        self.temp_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_home.cleanup)
+        self.outside_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.outside_dir.cleanup)
+        self.download_dir = os.path.join(self.temp_home.name, "Downloads", "Aether")
+        os.makedirs(self.download_dir, exist_ok=True)
+        self.ui_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ui"))
+
+        self._expanduser_patch = patch(
+            "os.path.expanduser",
+            side_effect=_make_fake_expanduser(self.temp_home.name),
+        )
+        self._expanduser_patch.start()
+        self.addCleanup(self._expanduser_patch.stop)
+
+        self.opened_folders = []
+        self.opener_error = None
+
+        def _fake_opener(path: str) -> None:
+            if self.opener_error is not None:
+                raise self.opener_error
+            self.opened_folders.append(path)
+
+        return create_app(
+            download_dir=self.download_dir,
+            ui_dir=self.ui_dir,
+            folder_opener=_fake_opener,
+        )
+
+    async def tearDownAsync(self) -> None:
+        app = getattr(self, "app", None)
+        if app is not None:
+            manager = app.get(MANAGER_KEY)
+            if manager is not None:
+                await manager.shutdown()
+        await asyncio.sleep(0)
+        await super().tearDownAsync()
+
+    async def test_open_folder_rejects_security_and_invalid_directories(self):
+        loopback_origin = f"http://127.0.0.1:{self.server.port}"
+
+        resp_text = await self.client.post(
+            "/api/system/open-folder",
+            data="{}",
+            headers={"Origin": loopback_origin, "Content-Type": "text/plain"},
+        )
+        self.assertEqual(resp_text.status, 415)
+
+        resp_evil_origin = await self.client.post(
+            "/api/system/open-folder",
+            json={},
+            headers={"Origin": "https://evil.com"},
+        )
+        self.assertEqual(resp_evil_origin.status, 403)
+
+        resp_cross_site = await self.client.post(
+            "/api/system/open-folder",
+            json={},
+            headers={"Origin": loopback_origin, "Sec-Fetch-Site": "cross-site"},
+        )
+        self.assertEqual(resp_cross_site.status, 403)
+
+        resp_bad_json = await self.client.post(
+            "/api/system/open-folder",
+            data="{bad-json",
+            headers={"Origin": loopback_origin, "Content-Type": "application/json"},
+        )
+        self.assertEqual(resp_bad_json.status, 400)
+
+        resp_list_body = await self.client.post(
+            "/api/system/open-folder",
+            json=["not-a-dict"],
+            headers={"Origin": loopback_origin},
+        )
+        self.assertEqual(resp_list_body.status, 400)
+
+        resp_non_str_dir = await self.client.post(
+            "/api/system/open-folder",
+            json={"dir": 123},
+            headers={"Origin": loopback_origin},
+        )
+        self.assertEqual(resp_non_str_dir.status, 400)
+
+        regular_file = os.path.join(self.download_dir, "not_a_dir.txt")
+        with open(regular_file, "w", encoding="utf-8") as fh:
+            fh.write("file")
+
+        non_existent = os.path.join(self.download_dir, "missing_subdir")
+        os.makedirs(os.path.join(self.temp_home.name, ".ssh"), exist_ok=True)
+
+        for bad_dir in [
+            "~/.ssh",
+            self.temp_home.name,
+            self.outside_dir.name,
+            non_existent,
+            regular_file,
+        ]:
+            with self.subTest(bad_dir=bad_dir):
+                resp_bad = await self.client.post(
+                    "/api/system/open-folder",
+                    json={"dir": bad_dir},
+                    headers={"Origin": loopback_origin},
+                )
+                self.assertEqual(resp_bad.status, 400)
+
+        symlink_dir = os.path.join(self.download_dir, "escape_dir_link")
+        try:
+            os.symlink(self.outside_dir.name, symlink_dir)
+        except (OSError, NotImplementedError):
+            symlink_dir = None
+
+        if symlink_dir is not None:
+            resp_sym = await self.client.post(
+                "/api/system/open-folder",
+                json={"dir": symlink_dir},
+                headers={"Origin": loopback_origin},
+            )
+            self.assertEqual(resp_sym.status, 400)
+
+        self.assertEqual(self.opened_folders, [])
+
+    async def test_open_folder_invokes_injected_opener_for_default_and_valid_subdirs(self):
+        loopback_origin = f"http://127.0.0.1:{self.server.port}"
+
+        resp_default = await self.client.post(
+            "/api/system/open-folder",
+            json={},
+            headers={"Origin": loopback_origin},
+        )
+        self.assertEqual(resp_default.status, 200)
+        data_default = await resp_default.json()
+        expected_default = os.path.realpath(self.download_dir)
+        self.assertEqual(data_default, {"success": True, "path": expected_default})
+
+        for default_payload in ({"dir": None}, {"dir": "   "}):
+            with self.subTest(default_payload=default_payload):
+                resp_fallback = await self.client.post(
+                    "/api/system/open-folder",
+                    json=default_payload,
+                    headers={"Origin": loopback_origin},
+                )
+                self.assertEqual(resp_fallback.status, 200)
+                self.assertEqual(
+                    await resp_fallback.json(),
+                    {"success": True, "path": expected_default},
+                )
+
+        subdir = os.path.join(self.download_dir, "nested", "sub")
+        os.makedirs(subdir, exist_ok=True)
+        resp_subdir = await self.client.post(
+            "/api/system/open-folder",
+            json={"dir": subdir},
+            headers={"Origin": loopback_origin},
+        )
+        self.assertEqual(resp_subdir.status, 200)
+        data_subdir = await resp_subdir.json()
+        expected_subdir = os.path.realpath(subdir)
+        self.assertEqual(data_subdir, {"success": True, "path": expected_subdir})
+
+        resp_quick = await self.client.post(
+            "/api/system/open-folder",
+            json={"dir": "~/Downloads"},
+            headers={"Origin": loopback_origin},
+        )
+        self.assertEqual(resp_quick.status, 200)
+        data_quick = await resp_quick.json()
+        expected_quick = os.path.realpath(os.path.join(self.temp_home.name, "Downloads"))
+        self.assertEqual(data_quick, {"success": True, "path": expected_quick})
+
+        self.assertEqual(
+            self.opened_folders,
+            [
+                expected_default,
+                expected_default,
+                expected_default,
+                expected_subdir,
+                expected_quick,
+            ],
+        )
+
+    async def test_open_folder_returns_500_when_opener_fails(self):
+        self.opener_error = OSError("desktop file manager failed")
+        resp = await self.client.post(
+            "/api/system/open-folder",
+            json={},
+            headers={"Origin": f"http://127.0.0.1:{self.server.port}"},
+        )
+        self.assertEqual(resp.status, 500)
+        data = await resp.json()
+        self.assertIn("error", data)
+
+
+class TestCrossPlatformSystemHelpers(unittest.TestCase):
+    def test_get_platform_key_normalizes_os_names(self):
+        for raw_system, expected in [
+            ("Linux", "linux"),
+            ("Windows", "windows"),
+            ("Darwin", "darwin"),
+        ]:
+            with self.subTest(raw_system=raw_system):
+                with patch("server.app.platform.system", return_value=raw_system):
+                    self.assertEqual(server_app._get_platform_key(), expected)
+
+    def test_get_quick_folders_os_variants_dedup_and_security(self):
+        with tempfile.TemporaryDirectory() as tmp_home:
+            download_dir = os.path.join(tmp_home, "Downloads", "Aether")
+            os.makedirs(download_dir, exist_ok=True)
+            with patch(
+                "os.path.expanduser",
+                side_effect=_make_fake_expanduser(tmp_home),
+            ):
+                with patch("server.app.platform.system", return_value="Windows"):
+                    win_folders = server_app._get_quick_folders(download_dir)
+                self.assertEqual(
+                    win_folders[0],
+                    {"label": "Carpeta Aether", "path": download_dir},
+                )
+                win_paths = [item["path"] for item in win_folders]
+                self.assertIn("~/Downloads", win_paths)
+                self.assertIn("~/Videos", win_paths)
+                self.assertIn("~/Documents", win_paths)
+                self.assertIn("~/Desktop", win_paths)
+
+                with patch("server.app.platform.system", return_value="Darwin"):
+                    mac_folders = server_app._get_quick_folders(download_dir)
+                mac_paths = [item["path"] for item in mac_folders]
+                self.assertIn("~/Downloads", mac_paths)
+                self.assertIn("~/Movies", mac_paths)
+                self.assertIn("~/Documents", mac_paths)
+                self.assertIn("~/Desktop", mac_paths)
+
+                with patch("server.app.platform.system", return_value="Linux"):
+                    linux_en_folders = server_app._get_quick_folders(download_dir)
+                linux_en_paths = [item["path"] for item in linux_en_folders]
+                self.assertIn("~/Downloads", linux_en_paths)
+                self.assertIn("~/Videos", linux_en_paths)
+
+                for es_dir in ("Descargas", "Vídeos", "Documentos", "Escritorio"):
+                    os.makedirs(os.path.join(tmp_home, es_dir), exist_ok=True)
+                with patch("server.app.platform.system", return_value="Linux"):
+                    linux_es_folders = server_app._get_quick_folders(download_dir)
+                linux_es_paths = [item["path"] for item in linux_es_folders]
+                self.assertIn("~/Descargas", linux_es_paths)
+                self.assertIn("~/Vídeos", linux_es_paths)
+                self.assertIn("~/Documentos", linux_es_paths)
+                self.assertIn("~/Escritorio", linux_es_paths)
+
+                # Deduplicate when download_dir matches one of the quick folders
+                same_as_downloads = os.path.join(tmp_home, "Downloads")
+                with patch("server.app.platform.system", return_value="Windows"):
+                    dedup_folders = server_app._get_quick_folders(same_as_downloads)
+                self.assertEqual(dedup_folders[0]["label"], "Carpeta Aether")
+                self.assertEqual(
+                    [item for item in dedup_folders if item["path"] == "~/Downloads"],
+                    [],
+                )
+
+                for folder_list in (win_folders, mac_folders, linux_en_folders, linux_es_folders, dedup_folders):
+                    for item in folder_list:
+                        validate_output_dir(item["path"], download_dir)
+
+    def test_open_folder_native_uses_platform_opener_without_shell(self):
+        target = "/tmp/aether-test-dir"
+
+        with patch("server.app.platform.system", return_value="Linux"), patch(
+            "server.app.subprocess.Popen"
+        ) as mock_popen:
+            server_app._open_folder_native(target)
+        mock_popen.assert_called_once_with(
+            ["xdg-open", target],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        with patch("server.app.platform.system", return_value="Darwin"), patch(
+            "server.app.subprocess.Popen"
+        ) as mock_popen:
+            server_app._open_folder_native(target)
+        mock_popen.assert_called_once_with(["open", target])
+
+        with patch("server.app.platform.system", return_value="Windows"), patch(
+            "server.app.os.startfile",
+            create=True,
+        ) as mock_startfile:
+            server_app._open_folder_native(target)
+        mock_startfile.assert_called_once_with(target)
 
 
 if __name__ == "__main__":

@@ -217,43 +217,108 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // --- 5. RENDERIZADO DEL INSPECTOR DE SEGMENTOS (IDM VISUALIZER) ---
+  const ALLOWED_STATUSES = new Set([
+    "initializing",
+    "downloading",
+    "paused",
+    "completed",
+    "error",
+  ]);
+
+  function safeStatusClass(status) {
+    return ALLOWED_STATUSES.has(status) ? status : "initializing";
+  }
+
+  function safePercent(value) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return 0;
+    return Math.max(0, Math.min(100, num));
+  }
+
+  function createSvgIcon(width, height, fill, stroke, strokeWidth, childrenSpecs) {
+    const svgNs = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(svgNs, "svg");
+    svg.setAttribute("width", String(width));
+    svg.setAttribute("height", String(height));
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("fill", fill);
+    if (stroke) svg.setAttribute("stroke", stroke);
+    if (strokeWidth != null) svg.setAttribute("stroke-width", String(strokeWidth));
+    childrenSpecs.forEach(([tag, attrs]) => {
+      const child = document.createElementNS(svgNs, tag);
+      Object.entries(attrs).forEach(([key, val]) => {
+        child.setAttribute(key, String(val));
+      });
+      svg.appendChild(child);
+    });
+    return svg;
+  }
+
   function renderInspector(task) {
     if (!task) {
       inspectorPanel.style.display = "none";
       return;
     }
 
+    const taskProgress = safePercent(task.progress);
+    const segments = Array.isArray(task.segments) ? task.segments : [];
+
     inspectorPanel.style.display = "block";
     inspFilename.textContent = task.filename || "Descargando...";
-    inspUrl.textContent = task.url;
+    inspUrl.textContent = task.url || "";
 
     const downloadedStr = formatBytes(task.bytes_downloaded);
     const totalStr = task.total_size > 0 ? formatBytes(task.total_size) : "Desconocido";
     inspDownloadedSize.textContent = `${downloadedStr} / ${totalStr}`;
-    inspPercent.textContent = `${task.progress}%`;
-    inspProgressFill.style.width = `${task.progress}%`;
+    inspPercent.textContent = `${taskProgress}%`;
+    inspProgressFill.style.width = `${taskProgress}%`;
     inspEta.textContent = task.status === "completed" ? "¡Completado!" : formatEta(task.eta_seconds);
 
-    inspSegmentCount.textContent = `${task.segments.length} hilos asignados (${task.supports_range ? "Paralelo Concurrente" : "Stream Lineal"})`;
+    inspSegmentCount.textContent = `${segments.length} hilos asignados (${task.supports_range ? "Paralelo Concurrente" : "Stream Lineal"})`;
 
     // Renderizar bloques de segmentos
     inspSegmentsGrid.innerHTML = "";
-    task.segments.forEach(seg => {
+    segments.forEach(seg => {
+      const segStatus = safeStatusClass(seg.status);
+      const segProgress = safePercent(seg.progress);
+
       const block = document.createElement("div");
-      block.className = `segment-block ${seg.status === 'downloading' ? 'active' : ''} ${seg.status === 'completed' ? 'completed' : ''}`;
-      
-      const speed = seg.speed_bps > 0 ? `${(seg.speed_bps / (1024 * 1024)).toFixed(2)} MB/s` : (seg.status === 'completed' ? '✓ Listo' : '0 KB/s');
-      
-      block.innerHTML = `
-        <div class="segment-header font-mono">
-          <span class="segment-id">Hilo #${seg.id + 1}</span>
-          <span class="segment-speed">${speed}</span>
-        </div>
-        <div class="segment-bar">
-          <div class="segment-fill" style="width: ${seg.progress}%;"></div>
-        </div>
-        <span class="segment-range font-mono">${formatBytes(seg.current_byte - seg.start_byte)} / ${formatBytes(seg.total)}</span>
-      `;
+      const segStateClass = segStatus === "downloading" ? " active" : segStatus === "completed" ? " completed" : "";
+      block.className = `segment-block${segStateClass}`;
+
+      const speed = seg.speed_bps > 0
+        ? `${(seg.speed_bps / (1024 * 1024)).toFixed(2)} MB/s`
+        : (segStatus === "completed" ? "✓ Listo" : "0 KB/s");
+
+      const header = document.createElement("div");
+      header.className = "segment-header font-mono";
+
+      const segIdEl = document.createElement("span");
+      segIdEl.className = "segment-id";
+      segIdEl.textContent = `Hilo #${Number(seg.id) + 1}`;
+
+      const segSpeedEl = document.createElement("span");
+      segSpeedEl.className = "segment-speed";
+      segSpeedEl.textContent = speed;
+
+      header.appendChild(segIdEl);
+      header.appendChild(segSpeedEl);
+
+      const bar = document.createElement("div");
+      bar.className = "segment-bar";
+
+      const fill = document.createElement("div");
+      fill.className = "segment-fill";
+      fill.style.width = `${segProgress}%`;
+      bar.appendChild(fill);
+
+      const rangeEl = document.createElement("span");
+      rangeEl.className = "segment-range font-mono";
+      rangeEl.textContent = `${formatBytes(seg.current_byte - seg.start_byte)} / ${formatBytes(seg.total)}`;
+
+      block.appendChild(header);
+      block.appendChild(bar);
+      block.appendChild(rangeEl);
       inspSegmentsGrid.appendChild(block);
     });
 
@@ -264,70 +329,137 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // --- 6. RENDERIZADO DE LA COLA DE DESCARGAS ---
   function renderDownloadsList() {
+    downloadsListEl.innerHTML = "";
+
     if (downloads.length === 0) {
-      downloadsListEl.innerHTML = `
-        <div class="empty-state glass-card">
-          <div class="empty-icon">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-              <polyline points="7 10 12 15 17 10"></polyline>
-              <line x1="12" y1="15" x2="12" y2="3"></line>
-            </svg>
-          </div>
-          <h3>No hay descargas activas</h3>
-          <p>Pega un enlace para descargar a máxima velocidad saturando el ancho de banda con segmentación concurrente.</p>
-        </div>
-      `;
+      const emptyState = document.createElement("div");
+      emptyState.className = "empty-state glass-card";
+
+      const emptyIcon = document.createElement("div");
+      emptyIcon.className = "empty-icon";
+      emptyIcon.appendChild(
+        createSvgIcon(48, 48, "none", "currentColor", 1.5, [
+          ["path", { d: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" }],
+          ["polyline", { points: "7 10 12 15 17 10" }],
+          ["line", { x1: 12, y1: 15, x2: 12, y2: 3 }],
+        ])
+      );
+
+      const heading = document.createElement("h3");
+      heading.textContent = "No hay descargas activas";
+
+      const desc = document.createElement("p");
+      desc.textContent = "Pega un enlace para descargar a máxima velocidad saturando el ancho de banda con segmentación concurrente.";
+
+      emptyState.appendChild(emptyIcon);
+      emptyState.appendChild(heading);
+      emptyState.appendChild(desc);
+      downloadsListEl.appendChild(emptyState);
       return;
     }
 
-    downloadsListEl.innerHTML = "";
     downloads.forEach(task => {
+      const safeStatus = safeStatusClass(task.status);
+      const taskProgress = safePercent(task.progress);
+
       const card = document.createElement("div");
-      card.className = `download-item-card glass-card ${selectedTaskId === task.id ? 'selected' : ''}`;
-      card.onclick = () => {
+      card.className = `download-item-card glass-card${selectedTaskId === task.id ? " selected" : ""}`;
+      card.addEventListener("click", () => {
         selectedTaskId = task.id;
         renderAll();
-      };
+      });
 
       const speedFmt = formatSpeed(task.speed_bps);
-      const isSelected = selectedTaskId === task.id;
 
-      card.innerHTML = `
-        <div class="item-main">
-          <div class="item-title-row">
-            <span class="item-filename">${task.filename}</span>
-            <span class="item-badge badge-${task.status}">${task.status}</span>
-          </div>
-          <div class="item-meta font-mono">
-            <span>${formatBytes(task.bytes_downloaded)} / ${task.total_size > 0 ? formatBytes(task.total_size) : '?'}</span>
-            <span>${task.speed_bps > 0 ? `${speedFmt.val} ${speedFmt.unit}` : ''}</span>
-            <span>${task.progress}%</span>
-            <span>${task.connections} hilos</span>
-          </div>
-          <div class="item-progress-track">
-            <div class="item-progress-fill" style="width: ${task.progress}%;"></div>
-          </div>
-        </div>
+      const itemMain = document.createElement("div");
+      itemMain.className = "item-main";
 
-        <div class="item-actions">
-          <button class="btn-icon" title="Pausar / Reanudar" onclick="event.stopPropagation(); window.aetherTogglePause('${task.id}', '${task.status}')">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-              ${task.status === 'downloading' 
-                ? '<rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect>'
-                : '<polygon points="5 3 19 12 5 21 5 3"></polygon>'
-              }
-            </svg>
-          </button>
-          <button class="btn-icon btn-danger" title="Eliminar" onclick="event.stopPropagation(); window.aetherDelete('${task.id}')">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-        </div>
-      `;
+      const titleRow = document.createElement("div");
+      titleRow.className = "item-title-row";
 
+      const filenameEl = document.createElement("span");
+      filenameEl.className = "item-filename";
+      filenameEl.textContent = task.filename || "";
+
+      const badgeEl = document.createElement("span");
+      badgeEl.className = `item-badge badge-${safeStatus}`;
+      badgeEl.textContent = task.status || safeStatus;
+
+      titleRow.appendChild(filenameEl);
+      titleRow.appendChild(badgeEl);
+
+      const metaEl = document.createElement("div");
+      metaEl.className = "item-meta font-mono";
+
+      const sizeSpan = document.createElement("span");
+      sizeSpan.textContent = `${formatBytes(task.bytes_downloaded)} / ${task.total_size > 0 ? formatBytes(task.total_size) : "?"}`;
+
+      const speedSpan = document.createElement("span");
+      speedSpan.textContent = task.speed_bps > 0 ? `${speedFmt.val} ${speedFmt.unit}` : "";
+
+      const progressSpan = document.createElement("span");
+      progressSpan.textContent = `${taskProgress}%`;
+
+      const connSpan = document.createElement("span");
+      connSpan.textContent = `${Number(task.connections) || 0} hilos`;
+
+      metaEl.appendChild(sizeSpan);
+      metaEl.appendChild(speedSpan);
+      metaEl.appendChild(progressSpan);
+      metaEl.appendChild(connSpan);
+
+      const trackEl = document.createElement("div");
+      trackEl.className = "item-progress-track";
+
+      const fillEl = document.createElement("div");
+      fillEl.className = "item-progress-fill";
+      fillEl.style.width = `${taskProgress}%`;
+      trackEl.appendChild(fillEl);
+
+      itemMain.appendChild(titleRow);
+      itemMain.appendChild(metaEl);
+      itemMain.appendChild(trackEl);
+
+      const actionsEl = document.createElement("div");
+      actionsEl.className = "item-actions";
+
+      const pauseBtn = document.createElement("button");
+      pauseBtn.className = "btn-icon";
+      pauseBtn.title = "Pausar / Reanudar";
+      pauseBtn.appendChild(
+        safeStatus === "downloading"
+          ? createSvgIcon(14, 14, "currentColor", null, null, [
+              ["rect", { x: 6, y: 4, width: 4, height: 16 }],
+              ["rect", { x: 14, y: 4, width: 4, height: 16 }],
+            ])
+          : createSvgIcon(14, 14, "currentColor", null, null, [
+              ["polygon", { points: "5 3 19 12 5 21 5 3" }],
+            ])
+      );
+      pauseBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        togglePause(task.id, task.status);
+      });
+
+      const deleteBtn = document.createElement("button");
+      deleteBtn.className = "btn-icon btn-danger";
+      deleteBtn.title = "Eliminar";
+      deleteBtn.appendChild(
+        createSvgIcon(14, 14, "none", "currentColor", 2, [
+          ["line", { x1: 18, y1: 6, x2: 6, y2: 18 }],
+          ["line", { x1: 6, y1: 6, x2: 18, y2: 18 }],
+        ])
+      );
+      deleteBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        deleteTask(task.id);
+      });
+
+      actionsEl.appendChild(pauseBtn);
+      actionsEl.appendChild(deleteBtn);
+
+      card.appendChild(itemMain);
+      card.appendChild(actionsEl);
       downloadsListEl.appendChild(card);
     });
   }
@@ -340,13 +472,10 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // --- 7. ACCIONES DE CONTROL ---
-  window.aetherTogglePause = (taskId, status) => togglePause(taskId, status);
-  window.aetherDelete = (taskId) => deleteTask(taskId);
-
   async function togglePause(taskId, status) {
     const action = status === "downloading" ? "pause" : "resume";
     try {
-      await fetch(`/api/downloads/${taskId}/${action}`, { method: "POST" });
+      await fetch(`/api/downloads/${encodeURIComponent(taskId)}/${action}`, { method: "POST" });
     } catch (e) {
       console.error(`Error al ${action} descarga`, e);
     }
@@ -355,7 +484,7 @@ document.addEventListener("DOMContentLoaded", () => {
   async function deleteTask(taskId) {
     if (!confirm("¿Deseas eliminar esta descarga de la cola?")) return;
     try {
-      await fetch(`/api/downloads/${taskId}`, { method: "DELETE" });
+      await fetch(`/api/downloads/${encodeURIComponent(taskId)}`, { method: "DELETE" });
     } catch (e) {
       console.error("Error al eliminar descarga", e);
     }

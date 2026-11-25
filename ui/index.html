@@ -10,18 +10,13 @@
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 </head>
 <body>
-  <!-- Fondo con degradados de luz ambiental -->
-  <div class="ambient-glow glow-1"></div>
-  <div class="ambient-glow glow-2"></div>
-  <div class="ambient-glow glow-3"></div>
-
   <div class="app-container">
-    <!-- Barra Superior -->
+    <!-- Barra Superior Compacta -->
     <header class="glass-header">
       <div class="brand">
-        <div class="brand-logo">
+        <div class="brand-logo" aria-hidden="true">
           <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <circle cx="16" cy="16" r="14" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3" class="spin-slow" />
+            <circle cx="16" cy="16" r="14" stroke="currentColor" stroke-width="1.5" stroke-dasharray="3 3" />
             <path d="M16 6L23 18H9L16 6Z" fill="url(#brand-grad)" />
             <circle cx="16" cy="16" r="3" fill="#ffffff" />
             <defs>
@@ -34,26 +29,25 @@
         </div>
         <div class="brand-text">
           <h1>AETHER</h1>
-          <span class="badge-tag">DYNAMIC ACCELERATOR v1.0</span>
+          <span class="badge-tag">DYNAMIC ACCELERATOR v1.1</span>
         </div>
       </div>
 
       <div class="header-actions">
-        <!-- Selector Dial de Tema (Impeccable Design) -->
-        <div class="theme-dial">
-          <button class="dial-btn active" data-set-theme="obsidian" title="Obsidian Glass (Transparente Cuántico)">
-            <span class="dial-dot dot-obsidian"></span> Obsidian
+        <div class="theme-dial" role="group" aria-label="Selector de tema">
+          <button type="button" class="dial-btn active" data-set-theme="obsidian" aria-pressed="true" title="Obsidian Glass (Transparente Cuántico)">
+            <span class="dial-dot dot-obsidian" aria-hidden="true"></span> Obsidian
           </button>
-          <button class="dial-btn" data-set-theme="cyber" title="Cyber Neon (Flúor Eléctrico)">
-            <span class="dial-dot dot-cyber"></span> Cyber
+          <button type="button" class="dial-btn" data-set-theme="cyber" aria-pressed="false" title="Cyber Neon (Flúor Eléctrico)">
+            <span class="dial-dot dot-cyber" aria-hidden="true"></span> Cyber
           </button>
-          <button class="dial-btn" data-set-theme="oled" title="OLED Frost (Monocromo Minimalista)">
-            <span class="dial-dot dot-oled"></span> Frost
+          <button type="button" class="dial-btn" data-set-theme="oled" aria-pressed="false" title="OLED Frost (Monocromo Minimalista)">
+            <span class="dial-dot dot-oled" aria-hidden="true"></span> Frost
           </button>
         </div>
 
-        <button class="btn-primary" id="btn-open-modal">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button type="button" class="btn-primary" id="btn-open-modal">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
             <line x1="12" y1="5" x2="12" y2="19"></line>
             <line x1="5" y1="12" x2="19" y2="12"></line>
           </svg>
@@ -62,120 +56,64 @@
       </div>
     </header>
 
-    <!-- Métricas en Vivo -->
-    <section class="metrics-grid">
-      <div class="metric-card glass-card">
-        <div class="metric-header">
-          <span class="metric-title">Velocidad Global</span>
-          <span class="live-dot" id="live-indicator"></span>
+    <!-- Franja Compacta de Actividad en Vivo -->
+    <section class="activity-strip glass-card" aria-label="Actividad global del acelerador">
+      <div class="activity-speed-block">
+        <div class="activity-status-row">
+          <span class="live-dot disconnected" id="live-indicator" title="Conectando con el motor..."></span>
+          <span class="activity-label">Velocidad Global</span>
         </div>
-        <div class="metric-value-group">
+        <div class="activity-speed-value">
           <span class="metric-number font-mono" id="total-speed">0.0</span>
           <span class="metric-unit font-mono" id="total-speed-unit">MB/s</span>
         </div>
-        <!-- Sparkline SVG de velocidad en tiempo real -->
-        <div class="sparkline-wrapper">
-          <svg id="speed-sparkline" viewBox="0 0 300 50" preserveAspectRatio="none">
-            <defs>
-              <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="0%" stop-color="var(--accent-primary)" stop-opacity="0.4" />
-                <stop offset="100%" stop-color="var(--accent-primary)" stop-opacity="0.0" />
-              </linearGradient>
-            </defs>
-            <path id="sparkline-area" d="M0,50 L300,50" fill="url(#spark-grad)"></path>
-            <path id="sparkline-line" d="M0,50 L300,50" fill="none" stroke="var(--accent-primary)" stroke-width="2"></path>
-          </svg>
+      </div>
+
+      <div class="activity-divider" aria-hidden="true"></div>
+
+      <div class="activity-threads-block">
+        <span class="activity-label" id="active-tasks-label">0 descargas activas</span>
+        <div class="activity-threads-value">
+          <span class="threads-number font-mono" id="total-threads">0</span>
+          <span class="threads-unit">hilos TCP</span>
         </div>
       </div>
 
-      <div class="metric-card glass-card">
-        <div class="metric-header">
-          <span class="metric-title">Hilos TCP Activos</span>
-          <span class="metric-sub" id="active-tasks-label">0 descargas activas</span>
-        </div>
-        <div class="metric-value-group">
-          <span class="metric-number font-mono" id="total-threads">0</span>
-          <span class="metric-unit">Conexiones</span>
-        </div>
-        <div class="metric-footer-note">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline>
-          </svg>
-          Segmentación dinámica continua
-        </div>
+      <div class="activity-sparkline-block" aria-hidden="true">
+        <svg id="speed-sparkline" viewBox="0 0 300 50" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="spark-grad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--accent-primary)" stop-opacity="0.38" />
+              <stop offset="100%" stop-color="var(--accent-primary)" stop-opacity="0.0" />
+            </linearGradient>
+          </defs>
+          <path id="sparkline-area" d="M0,50 L300,50" fill="url(#spark-grad)"></path>
+          <path id="sparkline-line" d="M0,50 L300,50" fill="none" stroke="var(--accent-primary)" stroke-width="2"></path>
+        </svg>
       </div>
 
-      <div class="metric-card glass-card">
-        <div class="metric-header">
-          <span class="metric-title">Ruta de Descargas</span>
-          <span class="badge-pill">Linux NVMe</span>
-        </div>
-        <div class="dir-display font-mono" id="download-dir-text">~/Descargas</div>
-        <div class="metric-footer-note">Pre-asignación con zero-wait truncate</div>
-      </div>
+      <button type="button" class="btn-folder" id="btn-open-folder" title="Abrir carpeta de descargas">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <span class="folder-btn-meta">
+          <span class="folder-btn-label">Abrir carpeta</span>
+          <span class="folder-btn-path font-mono" id="download-dir-text">Carpeta predeterminada</span>
+        </span>
+      </button>
     </section>
 
-    <!-- Visualizador de Segmentos Dinámico (IDM Style) -->
-    <section class="inspector-section glass-card" id="inspector-panel" style="display: none;">
-      <div class="inspector-header">
-        <div class="inspector-title-group">
-          <div class="status-indicator-ring active"></div>
-          <div>
-            <h3 class="inspector-filename" id="insp-filename">archivo_grande.iso</h3>
-            <span class="inspector-url font-mono" id="insp-url">https://ejemplo.com/...</span>
-          </div>
-        </div>
-        <div class="inspector-actions">
-          <button class="btn-icon" id="insp-pause-btn" title="Pausar / Reanudar">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-              <rect x="6" y="4" width="4" height="16"></rect>
-              <rect x="14" y="4" width="4" height="16"></rect>
-            </svg>
-          </button>
-          <button class="btn-icon btn-danger" id="insp-delete-btn" title="Cancelar">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-        </div>
-      </div>
-
-      <div class="inspector-progress-summary">
-        <div class="progress-labels">
-          <span class="font-mono" id="insp-downloaded-size">0 MB / 0 MB</span>
-          <span class="progress-percent font-mono" id="insp-percent">0%</span>
-          <span class="font-mono text-dim" id="insp-eta">ETA: Calculando...</span>
-        </div>
-        <div class="global-progress-bar">
-          <div class="global-progress-fill" id="insp-progress-fill" style="width: 0%;"></div>
-        </div>
-      </div>
-
-      <!-- Matriz de Segmentos Paralelos Multi-hilo -->
-      <div class="segments-visualizer">
-        <div class="segments-header">
-          <span class="segments-title">MAPA DE SEGMENTACIÓN MULTI-HILO (DYNAMIC CONCURRENT STREAMS)</span>
-          <span class="segments-count font-mono" id="insp-segment-count">8 hilos asignados</span>
-        </div>
-        <div class="segments-grid" id="insp-segments-grid">
-          <!-- Bloques de segmentos inyectados dinámicamente -->
-        </div>
-      </div>
-    </section>
-
-    <!-- Lista de Descargas -->
-    <section class="downloads-section">
+    <!-- Lista de Descargas en Primer Plano -->
+    <main class="downloads-section">
       <div class="section-header">
         <h2>Cola de Transferencias</h2>
-        <span class="counter-badge" id="downloads-count">0</span>
+        <span class="counter-badge font-mono" id="downloads-count">0</span>
       </div>
 
       <div class="downloads-list" id="downloads-list">
-        <!-- Tarjeta de descarga vacía por defecto -->
         <div class="empty-state glass-card">
-          <div class="empty-icon">
-            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <div class="empty-icon" aria-hidden="true">
+            <svg width="42" height="42" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
               <polyline points="7 10 12 15 17 10"></polyline>
               <line x1="12" y1="15" x2="12" y2="3"></line>
@@ -185,26 +123,26 @@
           <p>Pega un enlace para descargar a máxima velocidad saturando el ancho de banda con segmentación concurrente.</p>
         </div>
       </div>
-    </section>
+    </main>
   </div>
 
   <!-- Modal para Agregar Descarga -->
-  <div class="modal-backdrop" id="modal-new-download">
+  <div class="modal-backdrop" id="modal-new-download" role="dialog" aria-modal="true" aria-labelledby="modal-new-download-title">
     <div class="modal-glass-card">
       <div class="modal-header">
-        <h3>Nueva Descarga Acelerada</h3>
-        <button class="btn-close" id="btn-close-modal">✕</button>
+        <h3 id="modal-new-download-title">Nueva Descarga Acelerada</h3>
+        <button type="button" class="btn-close" id="btn-close-modal" aria-label="Cerrar modal">✕</button>
       </div>
 
       <form id="form-new-download">
         <div class="form-group">
           <label for="input-url">URL de Descarga Directa</label>
           <div class="input-with-action">
-            <input 
-              type="url" 
-              id="input-url" 
-              placeholder="https://servidor.com/archivo-pesado.iso" 
-              required 
+            <input
+              type="url"
+              id="input-url"
+              placeholder="https://servidor.com/archivo-pesado.iso"
+              required
               autocomplete="off"
             />
             <button type="button" class="btn-secondary" id="btn-paste" title="Pegar del portapapeles">
@@ -245,14 +183,9 @@
         <div class="form-group">
           <label for="input-dir">Carpeta de Destino</label>
           <div class="input-with-action">
-            <input type="text" id="input-dir" placeholder="~/Descargas/Aether" />
-            <select id="quick-folders" class="custom-select" style="max-width: 160px;">
+            <input type="text" id="input-dir" placeholder="Carpeta de destino predeterminada" />
+            <select id="quick-folders" class="custom-select quick-folders-select" aria-label="Rutas rápidas">
               <option value="">Rutas rápidas...</option>
-              <option value="~/Descargas">📁 Descargas</option>
-              <option value="~/Descargas/Aether">⚡ Aether</option>
-              <option value="~/Videos">🎬 Vídeos</option>
-              <option value="~/Documentos">📄 Documentos</option>
-              <option value="~/Escritorio">🖥️ Escritorio</option>
             </select>
           </div>
         </div>
@@ -260,7 +193,7 @@
         <div class="modal-footer">
           <button type="button" class="btn-ghost" id="btn-cancel-modal">Cancelar</button>
           <button type="submit" class="btn-primary glow-button">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
             </svg>
             Acelerar y Descargar
@@ -269,6 +202,34 @@
       </form>
     </div>
   </div>
+
+  <!-- Modal Accesible de Confirmación de Eliminación -->
+  <div class="modal-backdrop" id="modal-delete-download" role="dialog" aria-modal="true" aria-labelledby="modal-delete-title">
+    <div class="modal-glass-card modal-sm">
+      <div class="modal-header">
+        <h3 id="modal-delete-title">Eliminar Descarga</h3>
+        <button type="button" class="btn-close" id="btn-close-delete-modal" aria-label="Cerrar modal">✕</button>
+      </div>
+
+      <div class="delete-modal-body">
+        <p class="delete-modal-prompt">¿Deseas eliminar esta descarga de la cola?</p>
+        <div class="delete-filename-box font-mono" id="delete-modal-filename"></div>
+
+        <label class="checkbox-row" for="checkbox-delete-file">
+          <input type="checkbox" id="checkbox-delete-file" />
+          <span>Eliminar también el archivo descargado del disco</span>
+        </label>
+      </div>
+
+      <div class="modal-footer">
+        <button type="button" class="btn-ghost" id="btn-cancel-delete-modal">Cancelar</button>
+        <button type="button" class="btn-danger-solid" id="btn-confirm-delete">Eliminar</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notificaciones Toast Accesibles -->
+  <div class="toast-container" id="toast-container" aria-live="polite"></div>
 
   <script src="/static/app.js"></script>
 </body>

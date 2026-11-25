@@ -68,3 +68,7 @@ venv.bak/
 *~
 .DS_Store
 Thumbs.db
+
+# Superpowers isolated worktrees & SDD scratch
+.worktrees/
+.superpowers/

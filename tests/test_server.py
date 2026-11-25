@@ -11,13 +11,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import aiohttp
-from aiohttp import web
+from aiohttp import web, WSMsgType, WSCloseCode
 from aiohttp.test_utils import AioHTTPTestCase
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from core.manager import QueueManager
-from server.app import MANAGER_KEY, create_app
+from server.app import MANAGER_KEY, WEBSOCKETS_KEY, create_app
 
 
 def _make_fake_expanduser(home_dir: str):
@@ -580,10 +580,44 @@ class TestQueueManagerSecurity(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.manager.remove_download(escaped_task.task_id, delete_file=True)
             self.assertTrue(os.path.exists(outside_target))
+        finally:
+            await runner.cleanup()
 
-            # 3. Symlink escape inside output_dir pointing outside must be refused
-            symlink_path = os.path.join(escaped_task.output_dir, "escape_link.bin")
+    async def test_remove_download_refuses_symlink_escape(self):
+        outside_target = os.path.join(self.outside_dir.name, "precious_symlink.txt")
+        with open(outside_target, "w", encoding="utf-8") as f:
+            f.write("do not delete")
+
+        symlink_path = os.path.join(os.path.realpath(self.download_dir), "escape_link.bin")
+        try:
             os.symlink(outside_target, symlink_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks require elevated privileges on this OS")
+
+        mock_app = web.Application()
+        payload = b"QUEUE_MANAGER_SYMLINK_ESCAPE_TEST" * 16
+
+        async def handle_file(request):
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={"Accept-Ranges": "bytes", "Content-Length": str(len(payload))}
+                )
+            return web.Response(status=200, body=payload, headers={"Content-Length": str(len(payload))})
+
+        mock_app.router.add_route("*", "/item.bin", handle_file)
+        runner = web.AppRunner(mock_app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        try:
+            escaped_task = await self.manager.add_download(
+                url=f"http://127.0.0.1:{port}/item.bin",
+                threads=1,
+                filename="escape_target.bin",
+            )
+            await escaped_task.pause()
             escaped_task.output_path = symlink_path
 
             with self.assertRaises(ValueError):
@@ -591,6 +625,77 @@ class TestQueueManagerSecurity(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(os.path.exists(outside_target))
         finally:
             await runner.cleanup()
+
+
+class _OrderedWebSocketSet(set):
+    """Set determinista para asegurar que un WebSocket roto se cierre antes que uno sano."""
+
+    def __init__(self, items=()):
+        super().__init__(items)
+        self._order = list(items)
+
+    def add(self, item):
+        if item not in self:
+            self._order.append(item)
+        super().add(item)
+
+    def discard(self, item):
+        super().discard(item)
+        if item in self._order:
+            self._order.remove(item)
+
+    def __iter__(self):
+        return iter(self._order)
+
+
+class _BrokenWebSocket:
+    async def close(self, **kwargs):
+        raise ConnectionResetError("broken socket")
+
+
+class TestServerShutdown(unittest.IsolatedAsyncioTestCase):
+    async def test_on_shutdown_closes_healthy_websockets_when_earlier_socket_raises(self):
+        with tempfile.TemporaryDirectory() as download_dir:
+            ui_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ui"))
+            app = create_app(download_dir=download_dir, ui_dir=ui_dir)
+            broken_ws = _BrokenWebSocket()
+            app[WEBSOCKETS_KEY] = _OrderedWebSocketSet([broken_ws])
+
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    ws = await session.ws_connect(
+                        f"http://127.0.0.1:{port}/ws",
+                        headers={"Origin": f"http://127.0.0.1:{port}"},
+                    )
+                    try:
+                        init_msg = await ws.receive_json(timeout=2.0)
+                        self.assertEqual(init_msg["type"], "init")
+
+                        shutdown_task = asyncio.create_task(runner.shutdown())
+                        try:
+                            _, close_msg = await asyncio.wait_for(
+                                asyncio.gather(shutdown_task, ws.receive()),
+                                timeout=2.0,
+                            )
+                        finally:
+                            if not shutdown_task.done():
+                                shutdown_task.cancel()
+                                await asyncio.gather(shutdown_task, return_exceptions=True)
+
+                        self.assertEqual(close_msg.type, WSMsgType.CLOSE)
+                        self.assertEqual(close_msg.data, WSCloseCode.GOING_AWAY)
+                        self.assertEqual(close_msg.extra, "Server shutdown")
+                    finally:
+                        await ws.close()
+            finally:
+                app[WEBSOCKETS_KEY].discard(broken_ws)
+                await runner.cleanup()
 
 
 if __name__ == "__main__":

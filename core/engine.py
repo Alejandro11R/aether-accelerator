@@ -690,6 +690,20 @@ class DownloadTask:
                             await self._write_chunk(offset, chunk)
                         except OSError as e:
                             async with self._lock:
+                                segment.current_byte = max(
+                                    segment.start_byte,
+                                    segment.current_byte - chunk_len,
+                                )
+                                segment.bytes_downloaded = max(
+                                    0,
+                                    segment.bytes_downloaded - chunk_len,
+                                )
+                                self.bytes_downloaded = max(
+                                    0,
+                                    self.bytes_downloaded - chunk_len,
+                                )
+                                if segment.status == "completed":
+                                    segment.status = "downloading"
                                 self._set_error_state(segment, f"Error de escritura en disco: {e}")
                             return
 
@@ -816,6 +830,7 @@ class DownloadTask:
                                 self.total_size = int(cl)
                                 seg.end_byte = max(0, self.total_size - 1)
 
+                        self._cleanup_meta_files()
                         try:
                             self._file_handle = open(self.output_path, "wb")
                         except OSError as e:

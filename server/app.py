@@ -323,7 +323,10 @@ def create_app(
 
     async def on_shutdown(app_instance: web.Application):
         for ws in list(app_instance[WEBSOCKETS_KEY]):
-            await ws.close(code=WSCloseCode.GOING_AWAY, message=b"Server shutdown")
+            try:
+                await ws.close(code=WSCloseCode.GOING_AWAY, message=b"Server shutdown")
+            except Exception:
+                pass
 
     async def on_cleanup(app_instance: web.Application):
         await manager.shutdown()

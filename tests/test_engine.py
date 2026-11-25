@@ -6,6 +6,7 @@ Verifica la matemática de segmentación, particionado dinámico, pausa/reanudac
 
 import os
 import sys
+import errno
 import json
 import time
 import hashlib
@@ -1078,6 +1079,209 @@ class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.status, "error")
         self.assertTrue(task.error_message)
         self.assertLessEqual(get_count, 2)
+
+    async def test_range_fallback_to_single_stream_cleans_stale_meta_and_resumes_cleanly(self):
+        """Verifica que al degradar a flujo único sin Range se elimine .aether.json obsoleto."""
+        payload_size = 1024 * 1024  # 1 MB
+        payload = (b"RANGE_TO_SINGLE_FALLBACK_CLEAN_META\n" * 35000)[:payload_size]
+        expected_hash = hashlib.sha256(payload).hexdigest()
+
+        for subcase in ("drop_mid_stream", "pause_mid_stream"):
+            with self.subTest(subcase=subcase):
+                mode = {"phase": "range_pause"}
+
+                async def handle(request):
+                    phase = mode["phase"]
+                    if request.method == "HEAD":
+                        headers = {
+                            "Content-Length": str(payload_size),
+                            "ETag": '"fallback-v1"',
+                        }
+                        if phase in ("range_pause", "range_complete"):
+                            headers["Accept-Ranges"] = "bytes"
+                        return web.Response(headers=headers)
+
+                    if phase in ("range_pause", "range_complete"):
+                        range_header = request.headers.get("Range")
+                        if not range_header or not range_header.startswith("bytes="):
+                            return web.Response(status=416)
+                        start_s, end_s = range_header[6:].split("-")
+                        start = int(start_s)
+                        end = min(int(end_s) if end_s else payload_size - 1, payload_size - 1)
+                        slice_data = payload[start:end + 1]
+                        resp = web.StreamResponse(
+                            status=206,
+                            headers={
+                                "Content-Range": f"bytes {start}-{end}/{payload_size}",
+                                "Content-Length": str(len(slice_data)),
+                                "Accept-Ranges": "bytes",
+                                "ETag": '"fallback-v1"',
+                            },
+                        )
+                        await resp.prepare(request)
+                        try:
+                            for offset in range(0, len(slice_data), 65536):
+                                await resp.write(slice_data[offset:offset + 65536])
+                                if phase == "range_pause":
+                                    await asyncio.sleep(0.03)
+                            await resp.write_eof()
+                        except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+                            pass
+                        return resp
+
+                    resp = web.StreamResponse(
+                        status=200,
+                        headers={
+                            "Content-Length": str(payload_size),
+                            "ETag": '"fallback-v1"',
+                        },
+                    )
+                    await resp.prepare(request)
+                    try:
+                        await resp.write(payload[:65536])
+                        if phase == "non_range_drop":
+                            if request.transport is not None:
+                                request.transport.close()
+                            return resp
+                        await asyncio.sleep(3.0)
+                        await resp.write_eof()
+                    except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+                        pass
+                    return resp
+
+                runner, url = await self._start_local_server(handle)
+                try:
+                    task = DownloadTask(
+                        task_id=f"test_fallback_{subcase}",
+                        url=url,
+                        output_dir=self.test_dir.name,
+                        custom_filename=f"fallback_{subcase}.bin",
+                        connections=4,
+                        retry_base_delay=0.01,
+                    )
+
+                    # 1. Descarga Range inicial pausada a mitad -> deja .aether.json en disco
+                    job1 = asyncio.create_task(task.start())
+                    deadline = time.monotonic() + 2.0
+                    while task.bytes_downloaded == 0 and time.monotonic() < deadline:
+                        await asyncio.sleep(0.005)
+                    await asyncio.wait_for(task.pause(), timeout=2.0)
+                    await asyncio.wait_for(job1, timeout=2.0)
+                    self.assertEqual(task.status, "paused")
+                    self.assertTrue(os.path.exists(task.meta_path))
+
+                    # 2. Reanudar mientras el servidor omite Accept-Ranges y corta/pausa a mitad
+                    if subcase == "drop_mid_stream":
+                        mode["phase"] = "non_range_drop"
+                        await asyncio.wait_for(task.start(), timeout=3.0)
+                        self.assertEqual(task.status, "error")
+                    else:
+                        mode["phase"] = "non_range_pause"
+                        job2 = asyncio.create_task(task.start())
+                        deadline = time.monotonic() + 2.0
+                        while (len(task.segments) != 1 or task.bytes_downloaded == 0) and time.monotonic() < deadline:
+                            await asyncio.sleep(0.005)
+                        await asyncio.wait_for(task.pause(), timeout=2.0)
+                        await asyncio.wait_for(job2, timeout=2.0)
+                        self.assertEqual(task.status, "paused")
+
+                    self.assertFalse(os.path.exists(task.meta_path))
+                    self.assertFalse(os.path.exists(task.meta_path + ".tmp"))
+
+                    # 3. Restaurar Accept-Ranges y reanudar -> debe reiniciar desde 0 sin omitir bytes
+                    mode["phase"] = "range_complete"
+                    await asyncio.wait_for(task.start(), timeout=5.0)
+                finally:
+                    await runner.cleanup()
+
+                self.assertEqual(task.status, "completed")
+                self.assertFalse(os.path.exists(task.meta_path))
+                self.assertEqual(os.path.getsize(task.output_path), payload_size)
+                with open(task.output_path, "rb") as f:
+                    self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash)
+
+    async def test_worker_write_oserror_on_final_segment_chunk_rolls_back_and_resumes(self):
+        """Verifica rollback de offset/estado cuando _write_chunk falla en el último chunk y reanudación íntegra."""
+        payload_size = 256 * 1024
+        payload = (b"DISK_FULL_FINAL_CHUNK_ROLLBACK_TEST_0123456789\n" * 6000)[:payload_size]
+        expected_hash = hashlib.sha256(payload).hexdigest()
+
+        async def handle(request):
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(payload_size),
+                        "ETag": '"rollback-v1"',
+                    }
+                )
+            range_header = request.headers.get("Range", "bytes=0-")
+            start_s, end_s = range_header[6:].split("-")
+            start = int(start_s)
+            end = min(int(end_s) if end_s else payload_size - 1, payload_size - 1)
+            chunk = payload[start:end + 1]
+            return web.Response(
+                status=206,
+                body=chunk,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{payload_size}",
+                    "Content-Length": str(len(chunk)),
+                    "Accept-Ranges": "bytes",
+                    "ETag": '"rollback-v1"',
+                },
+            )
+
+        runner, url = await self._start_local_server(handle)
+        try:
+            task = DownloadTask(
+                task_id="test_disk_oserror_final_chunk",
+                url=url,
+                output_dir=self.test_dir.name,
+                custom_filename="disk_rollback.bin",
+                connections=2,
+            )
+            original_write = task._write_chunk
+            injected = {"failed": False}
+
+            async def fail_on_final_chunk(offset: int, data: bytes) -> None:
+                seg0 = task.segments[0]
+                if (
+                    not injected["failed"]
+                    and seg0.start_byte <= offset <= seg0.end_byte
+                    and offset + len(data) - 1 == seg0.end_byte
+                ):
+                    injected["failed"] = True
+                    raise OSError(errno.ENOSPC, "No space left on device")
+                await original_write(offset, data)
+
+            with patch.object(task, "_write_chunk", side_effect=fail_on_final_chunk):
+                await asyncio.wait_for(task.start(), timeout=3.0)
+
+            self.assertTrue(injected["failed"])
+            self.assertEqual(task.status, "error")
+            seg0 = task.segments[0]
+            self.assertEqual(seg0.status, "error")
+            self.assertLessEqual(seg0.current_byte, seg0.end_byte)
+            self.assertEqual(seg0.current_byte, seg0.start_byte + seg0.bytes_downloaded)
+            self.assertTrue(os.path.exists(task.meta_path))
+            with open(task.meta_path, "r", encoding="utf-8") as f:
+                saved_state = json.load(f)
+            self.assertLessEqual(
+                saved_state["segments"][0]["current_byte"],
+                saved_state["segments"][0]["end_byte"],
+            )
+
+            # Tras liberar espacio en disco, reanudar debe completar el bloque faltante con SHA-256 exacto
+            await asyncio.wait_for(task.start(), timeout=3.0)
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(task.bytes_downloaded, payload_size)
+        self.assertFalse(os.path.exists(task.meta_path))
+        self.assertEqual(os.path.getsize(task.output_path), payload_size)
+        with open(task.output_path, "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash)
 
 
 if __name__ == "__main__":

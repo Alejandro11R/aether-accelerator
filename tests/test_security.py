@@ -48,7 +48,13 @@ class TestSecurityValidation(unittest.TestCase):
         self.assertEqual(sanitize_remote_filename("..."), "download.bin")
         self.assertEqual(sanitize_remote_filename("bad<script>?.iso"), "bad_script__.iso")
 
-    def test_validate_output_dir_policies_and_symlink_escape(self):
+    def _create_symlink_or_skip(self, target: str, link_path: str) -> None:
+        try:
+            os.symlink(target, link_path)
+        except (OSError, NotImplementedError):
+            self.skipTest("Symlinks require elevated privileges on this OS")
+
+    def test_validate_output_dir_policies(self):
         with tempfile.TemporaryDirectory() as tmp_home, tempfile.TemporaryDirectory() as outside_dir:
             default_dir = os.path.join(tmp_home, "Downloads", "Aether")
             os.makedirs(default_dir, exist_ok=True)
@@ -59,18 +65,27 @@ class TestSecurityValidation(unittest.TestCase):
             nested_hidden = os.path.join(tmp_home, "Downloads", ".hidden")
             os.makedirs(nested_hidden, exist_ok=True)
 
-            symlink_escape = os.path.join(tmp_home, "Downloads", "escape_link")
-            os.symlink(outside_dir, symlink_escape)
-
             with patch("os.path.expanduser", side_effect=lambda p: tmp_home if p == "~" else p.replace("~/", tmp_home + "/", 1)):
                 self.assertEqual(validate_output_dir(None, default_dir), os.path.realpath(default_dir))
                 self.assertEqual(validate_output_dir("", default_dir), os.path.realpath(default_dir))
                 self.assertEqual(validate_output_dir("~/Videos", default_dir), os.path.realpath(safe_sub))
 
-                for forbidden in [tmp_home, "~", hidden_dir, nested_hidden, outside_dir, symlink_escape]:
+                for forbidden in [tmp_home, "~", hidden_dir, nested_hidden, outside_dir]:
                     with self.subTest(forbidden=forbidden):
                         with self.assertRaises(ValueError):
                             validate_output_dir(forbidden, default_dir)
+
+    def test_validate_output_dir_rejects_symlink_escape(self):
+        with tempfile.TemporaryDirectory() as tmp_home, tempfile.TemporaryDirectory() as outside_dir:
+            default_dir = os.path.join(tmp_home, "Downloads", "Aether")
+            os.makedirs(default_dir, exist_ok=True)
+
+            symlink_escape = os.path.join(tmp_home, "Downloads", "escape_link")
+            self._create_symlink_or_skip(outside_dir, symlink_escape)
+
+            with patch("os.path.expanduser", side_effect=lambda p: tmp_home if p == "~" else p.replace("~/", tmp_home + "/", 1)):
+                with self.assertRaises(ValueError):
+                    validate_output_dir(symlink_escape, default_dir)
 
     def test_ensure_within_directory_blocks_escapes(self):
         with tempfile.TemporaryDirectory() as base_dir, tempfile.TemporaryDirectory() as outside_dir:
@@ -91,9 +106,10 @@ class TestSecurityValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_custom_filename("trailing.")
 
+    def test_ensure_within_directory_blocks_symlink_escape(self):
         with tempfile.TemporaryDirectory() as base_dir, tempfile.TemporaryDirectory() as outside_dir:
             link_path = os.path.join(base_dir, "link.bin")
-            os.symlink(os.path.join(outside_dir, "secret.bin"), link_path)
+            self._create_symlink_or_skip(os.path.join(outside_dir, "secret.bin"), link_path)
             with self.assertRaises(ValueError):
                 ensure_within_directory(base_dir, link_path)
 

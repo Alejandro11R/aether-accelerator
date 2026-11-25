@@ -6,10 +6,12 @@ Verifica la matemática de segmentación, particionado dinámico, pausa/reanudac
 
 import os
 import sys
+import time
 import hashlib
 import tempfile
 import asyncio
 import unittest
+from unittest.mock import patch
 from aiohttp import web
 
 # Añadir raíz al path
@@ -59,6 +61,47 @@ class TestSegmentationLogic(unittest.TestCase):
         self.assertEqual(limiter.rate_bps, 100_000)
         limiter.set_rate(0) # Ilimitado
         self.assertEqual(limiter.rate_bps, 0)
+
+    def test_segment_windowed_speed_and_to_dict_schema(self):
+        seg = Segment(id=0, start_byte=0, current_byte=0, end_byte=999_999)
+        expected_keys = set(seg.to_dict().keys())
+        fake_clock = [100.0]
+        with patch("core.segment.time.monotonic", side_effect=lambda: fake_clock[0]):
+            seg.update_progress(65_536)  # t = 100.0 -> initializes window
+            fake_clock[0] = 100.1
+            seg.update_progress(65_536)  # < 0.2s window -> accumulates
+            fake_clock[0] = 100.25
+            seg.update_progress(65_536)  # 0.25s elapsed, 131_072 bytes in window
+        self.assertAlmostEqual(seg.speed_bps, 131_072 / 0.25, delta=1.0)
+        self.assertEqual(set(seg.to_dict().keys()), expected_keys)
+        self.assertNotIn("_window_bytes", seg.to_dict())
+
+
+class TestRateLimiterConcurrency(unittest.IsolatedAsyncioTestCase):
+    async def test_aggregate_rate_limit_across_concurrent_workers(self):
+        # 200 KB/s limit across 4 concurrent workers each consuming 5 x 16 KB = 320 KB total
+        # First ~200 KB uses initial 1s allowance, remaining 120 KB takes ~0.6s -> elapsed >= 0.45s
+        limiter = RateLimiter(rate_bps=200_000)
+        chunk = 16_000
+
+        async def worker():
+            for _ in range(5):
+                await limiter.consume(chunk)
+
+        start = time.monotonic()
+        await asyncio.gather(*(worker() for _ in range(4)))
+        elapsed = time.monotonic() - start
+        self.assertGreaterEqual(elapsed, 0.45)
+
+    async def test_live_set_rate_zero_wakes_sleeping_workers_quickly(self):
+        limiter = RateLimiter(rate_bps=10_000)
+        await limiter.consume(10_000)  # empty bucket
+        sleeper = asyncio.create_task(limiter.consume(50_000))  # would sleep ~5s
+        await asyncio.sleep(0.05)
+        limiter.set_rate(0)
+        start = time.monotonic()
+        await asyncio.wait_for(sleeper, timeout=0.6)
+        self.assertLess(time.monotonic() - start, 0.4)
 
 
 class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):

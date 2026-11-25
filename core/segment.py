@@ -18,6 +18,9 @@ class Segment:
     bytes_downloaded: int = 0
     last_update_time: float = 0.0
 
+    def __post_init__(self) -> None:
+        self._window_bytes = 0
+
     @property
     def total_bytes(self) -> int:
         return max(0, self.end_byte - self.start_byte + 1)
@@ -33,19 +36,26 @@ class Segment:
         done = self.current_byte - self.start_byte
         return min(100.0, max(0.0, (done / self.total_bytes) * 100.0))
 
-    def update_progress(self, new_bytes: int):
-        now = time.time()
+    def update_progress(self, new_bytes: int) -> None:
+        now = time.monotonic()
         self.bytes_downloaded += new_bytes
         self.current_byte += new_bytes
-        
-        delta = now - self.last_update_time
-        if delta >= 0.2 and self.last_update_time > 0:
-            instant_speed = new_bytes / delta
-            # Suavizado exponencial para evitar fluctuaciones erráticas
-            self.speed_bps = (self.speed_bps * 0.7) + (instant_speed * 0.3)
+
+        if self.last_update_time == 0:
             self.last_update_time = now
-        elif self.last_update_time == 0:
-            self.last_update_time = now
+        else:
+            self._window_bytes += new_bytes
+            delta = now - self.last_update_time
+            if delta >= 0.2:
+                instant_speed = self._window_bytes / delta
+                # Suavizado exponencial para evitar fluctuaciones erráticas
+                self.speed_bps = (
+                    instant_speed
+                    if self.speed_bps == 0.0
+                    else (self.speed_bps * 0.7) + (instant_speed * 0.3)
+                )
+                self.last_update_time = now
+                self._window_bytes = 0
 
         if self.current_byte > self.end_byte:
             self.status = "completed"

@@ -23,30 +23,37 @@ class RateLimiter:
     def __init__(self, rate_bps: int = 0):
         self.rate_bps = max(0, rate_bps)
         self.allowance = float(self.rate_bps)
-        self.last_check = time.time()
+        self.last_check = time.monotonic()
         self._lock = asyncio.Lock()
+        self._rate_epoch = 0
 
-    def set_rate(self, rate_bps: int):
+    def set_rate(self, rate_bps: int) -> None:
         self.rate_bps = max(0, rate_bps)
         self.allowance = float(self.rate_bps)
+        self.last_check = time.monotonic()
+        self._rate_epoch += 1
 
-    async def consume(self, amount: int):
-        if self.rate_bps <= 0:
-            return
+    async def consume(self, amount: int) -> None:
         async with self._lock:
-            now = time.time()
-            elapsed = now - self.last_check
+            if self.rate_bps <= 0:
+                return
+            now = time.monotonic()
+            elapsed = max(0.0, now - self.last_check)
             self.last_check = now
-            self.allowance += elapsed * self.rate_bps
-            if self.allowance > self.rate_bps:
-                self.allowance = float(self.rate_bps)
-            if self.allowance < amount:
-                deficit = amount - self.allowance
-                delay = deficit / self.rate_bps
-                self.allowance = 0.0
-                await asyncio.sleep(min(delay, 2.0))
-            else:
-                self.allowance -= amount
+            self.allowance = min(
+                float(self.rate_bps),
+                self.allowance + elapsed * self.rate_bps,
+            )
+            self.allowance -= amount
+            wait_time = (-self.allowance) / self.rate_bps if self.allowance < 0 else 0.0
+            epoch = self._rate_epoch
+
+        while wait_time > 0:
+            if self.rate_bps <= 0 or self._rate_epoch != epoch:
+                break
+            slice_s = min(wait_time, 0.2)
+            await asyncio.sleep(slice_s)
+            wait_time -= slice_s
 
 class DownloadTask:
     def __init__(

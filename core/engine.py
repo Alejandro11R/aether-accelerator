@@ -22,6 +22,8 @@ from core.security import (
 
 MIN_SPLIT_CHUNK = 2 * 1024 * 1024  # 2MB mínimo para dividir un segmento
 BUFFER_SIZE = 64 * 1024            # 64KB por paquete de lectura
+MAX_RETRIES = 5
+PERMANENT_HTTP_ERRORS = frozenset({400, 401, 403, 404, 405, 410, 416})
 
 class RateLimiter:
     """Implementación Token Bucket para limitar el ancho de banda sin jitter."""
@@ -69,7 +71,8 @@ class DownloadTask:
         custom_filename: Optional[str] = None,
         connections: int = 8,
         speed_limit_bps: int = 0,
-        on_update: Optional[Callable] = None
+        on_update: Optional[Callable] = None,
+        retry_base_delay: float = 0.5,
     ):
         self.task_id = task_id
         self.url = url
@@ -87,6 +90,7 @@ class DownloadTask:
         self.speed_limit_bps = speed_limit_bps
         self.rate_limiter = RateLimiter(speed_limit_bps)
         self.on_update = on_update
+        self.retry_base_delay = max(0.0, float(retry_base_delay))
 
         self.output_path = ensure_within_directory(
             self.output_dir,
@@ -258,7 +262,7 @@ class DownloadTask:
 
     def _save_state(self):
         """Persiste el estado de los segmentos en disco de forma atómica."""
-        if not self.supports_range or self.total_size <= 0:
+        if not self.supports_range or self.total_size <= 0 or not self.segments:
             return
         state = {
             "task_id": self.task_id,
@@ -317,6 +321,118 @@ class DownloadTask:
             pass
         return False
 
+    def _set_error_state(self, segment: Optional[Segment], message: str) -> None:
+        """Marca fallo fatal en la tarea y detiene los workers activos sin pisar una pausa."""
+        if self._stop_event.is_set() and self.status != "error":
+            if segment is not None and segment.status not in ("completed", "error"):
+                segment.status = "paused"
+            return
+        if segment is not None:
+            segment.status = "error"
+            segment.speed_bps = 0.0
+        if self.error_message is None:
+            self.error_message = message
+        self.status = "error"
+        self.speed_bps = 0.0
+        self._stop_event.set()
+
+    def _mark_segment_paused(
+        self,
+        segment: Segment,
+        *,
+        unknown_size: bool = False,
+        downloaded: int = 0,
+    ) -> None:
+        """Actualiza el segmento a paused respetando límites conocidos o finales de flujo."""
+        if unknown_size:
+            segment.end_byte = max(0, downloaded - 1)
+        if segment.status not in ("completed", "error") and self.status != "error":
+            segment.status = "paused"
+
+    def _advance_linear_segment(
+        self,
+        segment: Segment,
+        chunk_len: int,
+        expected_size: int,
+    ) -> None:
+        """Actualiza progreso lineal evitando que tamaño desconocido marque completed antes de EOF."""
+        if expected_size == 0:
+            segment.end_byte = max(segment.end_byte, segment.current_byte + chunk_len)
+        segment.update_progress(chunk_len)
+        if expected_size == 0:
+            segment.status = "downloading"
+        self.bytes_downloaded += chunk_len
+
+    def _finalize_linear_stream(
+        self,
+        segment: Segment,
+        expected_size: int,
+        downloaded: int,
+    ) -> None:
+        """Valida EOF o pausa al concluir la lectura de un flujo lineal."""
+        if self._stop_event.is_set():
+            self._mark_segment_paused(
+                segment,
+                unknown_size=(expected_size == 0),
+                downloaded=downloaded,
+            )
+            return
+        if expected_size > 0 and downloaded < expected_size:
+            self._set_error_state(segment, "Descarga truncada antes de completar Content-Length")
+            return
+        if expected_size == 0:
+            self.total_size = downloaded
+            segment.end_byte = max(0, downloaded - 1)
+        segment.status = "completed"
+        segment.speed_bps = 0.0
+
+    async def _sleep_or_stop(self, delay: float) -> bool:
+        """Espera el backoff exponencial o retorna True de inmediato si la tarea se detuvo."""
+        if self._stop_event.is_set():
+            return True
+        if delay <= 0:
+            await asyncio.sleep(0)
+            return self._stop_event.is_set()
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _wait_for_retry(
+        self,
+        segment: Segment,
+        retries: int,
+        exhausted_message: str,
+        *,
+        use_lock: bool = True,
+    ) -> Optional[int]:
+        """Aplica backoff exponencial acotado; retorna nuevo contador o None si debe abortar."""
+        next_retry = retries + 1
+        if next_retry > MAX_RETRIES:
+            if use_lock:
+                async with self._lock:
+                    self._set_error_state(segment, exhausted_message)
+            else:
+                self._set_error_state(segment, exhausted_message)
+            return None
+
+        if use_lock:
+            async with self._lock:
+                segment.status = "reconnecting"
+        else:
+            segment.status = "reconnecting"
+
+        delay = min(self.retry_base_delay * (2 ** (next_retry - 1)), 8.0)
+        if await self._sleep_or_stop(delay):
+            if use_lock:
+                async with self._lock:
+                    self._mark_segment_paused(segment)
+            else:
+                self._mark_segment_paused(segment)
+            return None
+        return next_retry
+
     async def start(self):
         """Inicia o reanuda la descarga acelerada."""
         self._stop_event.clear()
@@ -354,6 +470,8 @@ class DownloadTask:
 
                 # Abrir archivo para escrituras concurrentes
                 self._file_handle = open(self.output_path, "r+b")
+                balancer = None
+                speed_sampler = None
 
                 try:
                     self._workers = [
@@ -380,11 +498,25 @@ class DownloadTask:
                     speed_sampler.cancel()
                     await asyncio.gather(speed_sampler, return_exceptions=True)
 
-                    all_done = all(s.current_byte > s.end_byte for s in self.segments)
-                    if all_done and not self._stop_event.is_set():
+                    if self.supports_range:
+                        all_done = all(s.current_byte > s.end_byte for s in self.segments)
+                    else:
+                        all_done = len(self.segments) == 1 and self.segments[0].status == "completed"
+
+                    if all_done and not self._stop_event.is_set() and self.status != "error":
                         self.status = "completed"
                         self.speed_bps = 0.0
+                    elif self._stop_event.is_set() and self.status == "downloading":
+                        self.status = "paused"
+                        self.speed_bps = 0.0
                 finally:
+                    if balancer is not None and not balancer.done():
+                        balancer.cancel()
+                        await asyncio.gather(balancer, return_exceptions=True)
+                    if speed_sampler is not None and not speed_sampler.done():
+                        speed_sampler.cancel()
+                        await asyncio.gather(speed_sampler, return_exceptions=True)
+
                     if self._file_handle:
                         try:
                             self._file_handle.flush()
@@ -403,22 +535,92 @@ class DownloadTask:
                 self.last_sample_bytes = 0
                 self._init_segments()
                 speed_sampler = asyncio.create_task(self._speed_sampler())
+                single_task = asyncio.create_task(self._single_stream_download(session))
+                self._workers = [single_task]
                 try:
-                    await self._single_stream_download(session)
-                    if (
-                        self.segments
-                        and self.segments[0].status == "completed"
-                        and not self._stop_event.is_set()
-                    ):
+                    await asyncio.gather(single_task, return_exceptions=True)
+                    all_done = len(self.segments) == 1 and self.segments[0].status == "completed"
+                    if all_done and not self._stop_event.is_set() and self.status != "error":
                         self.status = "completed"
                         self.speed_bps = 0.0
                         self._cleanup_meta_files()
+                    elif self._stop_event.is_set() and self.status == "downloading":
+                        if self.segments and self.segments[0].status not in ("completed", "error"):
+                            self.segments[0].status = "paused"
+                        self.status = "paused"
+                        self.speed_bps = 0.0
                 finally:
-                    speed_sampler.cancel()
+                    if not single_task.done():
+                        single_task.cancel()
+                        await asyncio.gather(single_task, return_exceptions=True)
+                    if not speed_sampler.done():
+                        speed_sampler.cancel()
                     await asyncio.gather(speed_sampler, return_exceptions=True)
+
+    async def _consume_inline_200(
+        self,
+        resp: aiohttp.ClientResponse,
+        segment: Segment,
+    ) -> None:
+        """Degrada inline una respuesta 200 OK de conexión única sin lanzar un segundo GET."""
+        async with self._lock:
+            self.supports_range = False
+            cl = resp.headers.get("Content-Length")
+            expected_size = int(cl) if cl and cl.isdigit() else self.total_size
+            if cl and cl.isdigit():
+                self.total_size = expected_size
+                segment.end_byte = max(0, expected_size - 1)
+            segment.start_byte = 0
+            segment.current_byte = 0
+            segment.bytes_downloaded = 0
+            segment.status = "downloading"
+            self.bytes_downloaded = 0
+            self.last_sample_bytes = 0
+
+        try:
+            async with self._io_lock:
+                if self._file_handle and not self._file_handle.closed:
+                    self._file_handle.seek(0)
+                    self._file_handle.truncate(0)
+        except OSError as e:
+            async with self._lock:
+                self._set_error_state(segment, f"Error de escritura en disco: {e}")
+            return
+        self._cleanup_meta_files()
+
+        offset = 0
+        try:
+            while not self._stop_event.is_set():
+                chunk = await resp.content.read(BUFFER_SIZE)
+                if not chunk:
+                    break
+                chunk_len = len(chunk)
+                try:
+                    await self._write_chunk(offset, chunk)
+                except OSError as e:
+                    async with self._lock:
+                        self._set_error_state(segment, f"Error de escritura en disco: {e}")
+                    return
+
+                async with self._lock:
+                    self._advance_linear_segment(segment, chunk_len, expected_size)
+                offset += chunk_len
+                await self.rate_limiter.consume(chunk_len)
+        except asyncio.CancelledError:
+            async with self._lock:
+                self._mark_segment_paused(segment, unknown_size=(expected_size == 0), downloaded=offset)
+            return
+        except Exception as e:
+            async with self._lock:
+                self._set_error_state(segment, f"Error de transmisión: {e}")
+            return
+
+        async with self._lock:
+            self._finalize_linear_stream(segment, expected_size, offset)
 
     async def _worker(self, session: aiohttp.ClientSession, segment: Segment):
         """Worker individual que descarga un rango específico."""
+        retries = 0
         while not self._stop_event.is_set():
             async with self._lock:
                 if segment.current_byte > segment.end_byte:
@@ -434,16 +636,42 @@ class DownloadTask:
             }
 
             try:
-                async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=None, sock_read=30)) as resp:
-                    if resp.status not in (200, 206):
-                        segment.status = "error"
-                        await asyncio.sleep(2)
+                async with session.get(
+                    self.url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=None, sock_read=30),
+                ) as resp:
+                    if resp.status == 200:
+                        async with self._lock:
+                            can_degrade = len(self.segments) == 1 and segment.current_byte == 0
+                        if can_degrade:
+                            await self._consume_inline_200(resp, segment)
+                            return
+                        async with self._lock:
+                            self._set_error_state(segment, "El servidor ignoró Range y devolvió HTTP 200")
+                        return
+
+                    if resp.status in PERMANENT_HTTP_ERRORS:
+                        async with self._lock:
+                            self._set_error_state(segment, f"Error HTTP permanente {resp.status}")
+                        return
+
+                    if resp.status != 206:
+                        next_retry = await self._wait_for_retry(
+                            segment,
+                            retries,
+                            f"Error HTTP {resp.status} tras {MAX_RETRIES} reintentos",
+                        )
+                        if next_retry is None:
+                            return
+                        retries = next_retry
                         continue
 
                     while not self._stop_event.is_set():
                         chunk = await resp.content.read(BUFFER_SIZE)
                         if not chunk:
                             break
+                        retries = 0
 
                         async with self._lock:
                             remaining = segment.end_byte - segment.current_byte + 1
@@ -458,7 +686,13 @@ class DownloadTask:
                             self.bytes_downloaded += chunk_len
                             seg_done = segment.current_byte > segment.end_byte
 
-                        await self._write_chunk(offset, chunk)
+                        try:
+                            await self._write_chunk(offset, chunk)
+                        except OSError as e:
+                            async with self._lock:
+                                self._set_error_state(segment, f"Error de escritura en disco: {e}")
+                            return
+
                         await self.rate_limiter.consume(chunk_len)
 
                         if seg_done:
@@ -468,25 +702,43 @@ class DownloadTask:
                         if segment.current_byte > segment.end_byte:
                             segment.status = "completed"
                             break
-                        if self._stop_event.is_set() and segment.status != "error":
-                            segment.status = "paused"
+                        if self._stop_event.is_set():
+                            self._mark_segment_paused(segment)
                             break
 
-            except asyncio.CancelledError:
-                if segment.current_byte > segment.end_byte:
-                    segment.status = "completed"
-                else:
-                    segment.status = "paused"
-                break
-            except Exception:
-                if self._stop_event.is_set():
-                    segment.status = "paused"
-                    break
-                segment.status = "reconnecting"
-                await asyncio.sleep(1)
+                    next_retry = await self._wait_for_retry(
+                        segment,
+                        retries,
+                        f"Flujo 206 incompleto tras {MAX_RETRIES} reintentos",
+                    )
+                    if next_retry is None:
+                        return
+                    retries = next_retry
 
-        if self._stop_event.is_set() and segment.status not in ("completed", "error"):
-            segment.status = "paused"
+            except asyncio.CancelledError:
+                async with self._lock:
+                    if segment.current_byte > segment.end_byte:
+                        segment.status = "completed"
+                    else:
+                        self._mark_segment_paused(segment)
+                break
+            except Exception as e:
+                if self._stop_event.is_set():
+                    async with self._lock:
+                        self._mark_segment_paused(segment)
+                    break
+                next_retry = await self._wait_for_retry(
+                    segment,
+                    retries,
+                    f"Error de red tras {MAX_RETRIES} reintentos: {e}",
+                )
+                if next_retry is None:
+                    return
+                retries = next_retry
+
+        async with self._lock:
+            if self._stop_event.is_set():
+                self._mark_segment_paused(segment)
 
     async def _dynamic_balancer(self, session: aiohttp.ClientSession):
         """
@@ -497,7 +749,7 @@ class DownloadTask:
         while not self._stop_event.is_set():
             await asyncio.sleep(1.0)
             async with self._lock:
-                if self._stop_event.is_set():
+                if self._stop_event.is_set() or not self.supports_range:
                     break
                 completed = [s for s in self.segments if s.status == "completed"]
                 active = [s for s in self.segments if s.status == "downloading"]
@@ -530,22 +782,112 @@ class DownloadTask:
     async def _single_stream_download(self, session: aiohttp.ClientSession):
         """Descarga lineal en streaming para servidores que no aceptan Range."""
         seg = self.segments[0]
-        seg.status = "downloading"
         headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Aether/1.0"}
+        retries = 0
 
-        async with session.get(self.url, headers=headers, timeout=aiohttp.ClientTimeout(total=None, sock_read=30)) as resp:
-            with open(self.output_path, "wb") as f:
-                while not self._stop_event.is_set():
-                    chunk = await resp.content.read(BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    chunk_len = len(chunk)
-                    seg.update_progress(chunk_len)
-                    self.bytes_downloaded += chunk_len
-                    await self.rate_limiter.consume(chunk_len)
+        try:
+            while not self._stop_event.is_set():
+                seg.status = "downloading"
+                try:
+                    async with session.get(
+                        self.url,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=None, sock_read=30),
+                    ) as resp:
+                        if resp.status in PERMANENT_HTTP_ERRORS:
+                            self._set_error_state(seg, f"Error HTTP permanente {resp.status}")
+                            return
 
-        seg.status = "paused" if self._stop_event.is_set() else "completed"
+                        if resp.status != 200:
+                            next_retry = await self._wait_for_retry(
+                                seg,
+                                retries,
+                                f"Error HTTP {resp.status} tras {MAX_RETRIES} reintentos",
+                                use_lock=False,
+                            )
+                            if next_retry is None:
+                                return
+                            retries = next_retry
+                            continue
+
+                        if self.total_size == 0:
+                            cl = resp.headers.get("Content-Length")
+                            if cl and cl.isdigit():
+                                self.total_size = int(cl)
+                                seg.end_byte = max(0, self.total_size - 1)
+
+                        try:
+                            self._file_handle = open(self.output_path, "wb")
+                        except OSError as e:
+                            self._set_error_state(seg, f"Error al abrir archivo de salida: {e}")
+                            return
+
+                        try:
+                            while not self._stop_event.is_set():
+                                chunk = await resp.content.read(BUFFER_SIZE)
+                                if not chunk:
+                                    break
+                                chunk_len = len(chunk)
+                                try:
+                                    self._file_handle.write(chunk)
+                                except OSError as e:
+                                    self._set_error_state(seg, f"Error de escritura en disco: {e}")
+                                    return
+                                self._advance_linear_segment(seg, chunk_len, self.total_size)
+                                await self.rate_limiter.consume(chunk_len)
+                        finally:
+                            if self._file_handle:
+                                try:
+                                    self._file_handle.flush()
+                                except Exception:
+                                    pass
+                                self._file_handle.close()
+                                self._file_handle = None
+
+                        self._finalize_linear_stream(seg, self.total_size, self.bytes_downloaded)
+                        return
+
+                except asyncio.CancelledError:
+                    self._mark_segment_paused(
+                        seg,
+                        unknown_size=(self.total_size == 0),
+                        downloaded=self.bytes_downloaded,
+                    )
+                    return
+                except Exception as e:
+                    if self._stop_event.is_set():
+                        self._mark_segment_paused(
+                            seg,
+                            unknown_size=(self.total_size == 0),
+                            downloaded=self.bytes_downloaded,
+                        )
+                        return
+                    if self.bytes_downloaded > 0:
+                        self._set_error_state(seg, f"Error de transmisión: {e}")
+                        return
+                    next_retry = await self._wait_for_retry(
+                        seg,
+                        retries,
+                        f"Error de red tras {MAX_RETRIES} reintentos: {e}",
+                        use_lock=False,
+                    )
+                    if next_retry is None:
+                        return
+                    retries = next_retry
+        except asyncio.CancelledError:
+            self._mark_segment_paused(
+                seg,
+                unknown_size=(self.total_size == 0),
+                downloaded=self.bytes_downloaded,
+            )
+            return
+
+        if self._stop_event.is_set():
+            self._mark_segment_paused(
+                seg,
+                unknown_size=(self.total_size == 0),
+                downloaded=self.bytes_downloaded,
+            )
 
     async def _speed_sampler(self):
         """Muestra y calcula la velocidad global promedio cada 500ms."""
@@ -589,7 +931,7 @@ class DownloadTask:
             except Exception:
                 pass
 
-        if self.status != "completed":
+        if self.status not in ("completed", "error"):
             self.status = "paused"
             self.speed_bps = 0.0
             self._save_state()

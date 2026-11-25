@@ -572,6 +572,513 @@ class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(actual_hash, expected_hash)
         self.assertFalse(os.path.exists(task3.meta_path))
 
+    async def test_worker_stops_on_permanent_http_error_without_infinite_loop(self):
+        """Verifica que errores HTTP permanentes (404) detengan los workers sin bucle infinito."""
+        get_count = 0
+
+        async def handle(request):
+            nonlocal get_count
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": "100000",
+                    }
+                )
+            get_count += 1
+            return web.Response(status=404, text="Not Found")
+
+        runner, url = await self._start_local_server(handle)
+        try:
+            task = DownloadTask(
+                task_id="test_perm_404",
+                url=url,
+                output_dir=self.test_dir.name,
+                custom_filename="perm_404.bin",
+                connections=4,
+            )
+            await asyncio.wait_for(task.start(), timeout=2.0)
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(task.status, "error")
+        self.assertIn("404", task.error_message or "")
+        self.assertEqual(task.bytes_downloaded, 0)
+        self.assertLessEqual(get_count, 4)
+
+    async def test_worker_retries_transient_error_up_to_max_retries(self):
+        """Verifica reintentos con recuperación tras 503 y fallo acotado tras MAX_RETRIES."""
+        import core.engine as engine_mod
+
+        payload_size = 256 * 1024
+        payload = (b"TRANSIENT_503_RETRY_RECOVERY_SALT_1234567890\n" * 8000)[:payload_size]
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        range_hits = {}
+
+        async def handle_recover(request):
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(payload_size),
+                    }
+                )
+            range_header = request.headers.get("Range", "")
+            range_hits[range_header] = range_hits.get(range_header, 0) + 1
+            if range_hits[range_header] <= 2:
+                return web.Response(status=503, text="Service Unavailable")
+
+            start_s, end_s = range_header[6:].split("-")
+            start = int(start_s)
+            end = min(int(end_s) if end_s else payload_size - 1, payload_size - 1)
+            chunk = payload[start:end + 1]
+            return web.Response(
+                status=206,
+                body=chunk,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{payload_size}",
+                    "Content-Length": str(len(chunk)),
+                    "Accept-Ranges": "bytes",
+                },
+            )
+
+        runner, url = await self._start_local_server(handle_recover)
+        try:
+            task_ok = DownloadTask(
+                task_id="test_503_recover",
+                url=url,
+                output_dir=self.test_dir.name,
+                custom_filename="retry_recover.bin",
+                connections=2,
+                retry_base_delay=0.01,
+            )
+            await asyncio.wait_for(task_ok.start(), timeout=3.0)
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(task_ok.status, "completed")
+        self.assertEqual(task_ok.bytes_downloaded, payload_size)
+        with open(task_ok.output_path, "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash)
+        self.assertTrue(all(hits == 3 for hits in range_hits.values()))
+
+        # Caso separado: servidor devolviendo 503 de forma permanente -> error tras MAX_RETRIES
+        forever_hits = {}
+
+        async def handle_forever_503(request):
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(payload_size),
+                    }
+                )
+            range_header = request.headers.get("Range", "")
+            forever_hits[range_header] = forever_hits.get(range_header, 0) + 1
+            return web.Response(status=503, text="Always Unavailable")
+
+        runner2, url2 = await self._start_local_server(handle_forever_503)
+        try:
+            task_fail = DownloadTask(
+                task_id="test_503_exhaust",
+                url=url2,
+                output_dir=self.test_dir.name,
+                custom_filename="retry_exhaust.bin",
+                connections=2,
+                retry_base_delay=0.01,
+            )
+            await asyncio.wait_for(task_fail.start(), timeout=3.0)
+        finally:
+            await runner2.cleanup()
+
+        max_retries = getattr(engine_mod, "MAX_RETRIES", None)
+        self.assertEqual(max_retries, 5)
+        self.assertEqual(
+            getattr(engine_mod, "PERMANENT_HTTP_ERRORS", None),
+            frozenset({400, 401, 403, 404, 405, 410, 416}),
+        )
+        self.assertEqual(task_fail.status, "error")
+        self.assertTrue(task_fail.error_message)
+        self.assertGreaterEqual(sum(forever_hits.values()), max_retries + 1)
+        self.assertTrue(
+            all(hits <= max_retries + 1 for hits in forever_hits.values()),
+            f"Se excedió MAX_RETRIES + 1 por segmento: {forever_hits}",
+        )
+
+    async def test_multi_segment_worker_rejects_200_ok_without_corrupting_file(self):
+        """Verifica que descargas multisegmento rechacen HTTP 200 en peticiones Range."""
+        payload_size = 512 * 1024
+        payload = (b"RANGE_IGNORED_200_OK_CORRUPTION_GUARD\n" * 16000)[:payload_size]
+
+        async def handle(request):
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(payload_size),
+                    }
+                )
+            return web.Response(
+                status=200,
+                body=payload,
+                headers={"Content-Length": str(payload_size)},
+            )
+
+        runner, url = await self._start_local_server(handle)
+        try:
+            task = DownloadTask(
+                task_id="test_multi_200_reject",
+                url=url,
+                output_dir=self.test_dir.name,
+                custom_filename="multi_200.bin",
+                connections=4,
+                retry_base_delay=0.01,
+            )
+            await asyncio.wait_for(task.start(), timeout=3.0)
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(task.status, "error")
+        self.assertIn("200", task.error_message or "")
+        self.assertEqual(task.bytes_downloaded, 0)
+        if os.path.exists(task.output_path):
+            with open(task.output_path, "rb") as f:
+                self.assertEqual(f.read(), b"\x00" * payload_size)
+
+    async def test_single_connection_200_ok_degrades_inline_without_second_get(self):
+        """Verifica degradación inline cuando connections=1 recibe HTTP 200 sin segundo GET."""
+        payload_size = 1024 * 1024  # 1 MB
+        payload = (b"SINGLE_CONN_INLINE_200_FALLBACK_1MB\n" * 35000)[:payload_size]
+        expected_hash = hashlib.sha256(payload).hexdigest()
+        get_count = 0
+
+        async def handle(request):
+            nonlocal get_count
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(payload_size),
+                    }
+                )
+            get_count += 1
+            return web.Response(
+                status=200,
+                body=payload,
+                headers={"Content-Length": str(payload_size)},
+            )
+
+        runner, url = await self._start_local_server(handle)
+        try:
+            task = DownloadTask(
+                task_id="test_single_inline_200",
+                url=url,
+                output_dir=self.test_dir.name,
+                custom_filename="inline_200.bin",
+                connections=1,
+            )
+            await asyncio.wait_for(task.start(), timeout=5.0)
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(task.status, "completed")
+        self.assertEqual(get_count, 1)
+        self.assertFalse(task.supports_range)
+        self.assertEqual(task.bytes_downloaded, payload_size)
+        self.assertFalse(os.path.exists(task.meta_path))
+        with open(task.output_path, "rb") as f:
+            self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash)
+
+    async def test_single_stream_telemetry_pause_truncation_and_error_handling(self):
+        """Verifica telemetría, pausa/reanudación, 404/EOF truncado y reintento 503 en flujo único."""
+        # Sub-case A: non-Range sin Content-Length emite telemetría on_update y actualiza total_size
+        with self.subTest("subcase_a_telemetry_unknown_length"):
+            payload_a = (b"SINGLE_STREAM_UNKNOWN_LEN_TELEMETRY\n" * 8000)[:256 * 1024]
+            expected_hash_a = hashlib.sha256(payload_a).hexdigest()
+            updates_a = []
+
+            async def on_update_a(snapshot):
+                updates_a.append(snapshot)
+
+            async def handle_a(request):
+                if request.method == "HEAD":
+                    resp = web.StreamResponse(status=200)
+                    resp.enable_chunked_encoding()
+                    await resp.prepare(request)
+                    await resp.write_eof()
+                    return resp
+                resp = web.StreamResponse(status=200)
+                resp.enable_chunked_encoding()
+                await resp.prepare(request)
+                for offset in range(0, len(payload_a), 32768):
+                    await resp.write(payload_a[offset:offset + 32768])
+                    await asyncio.sleep(0.08)
+                await resp.write_eof()
+                return resp
+
+            runner_a, url_a = await self._start_local_server(handle_a)
+            try:
+                task_a = DownloadTask(
+                    task_id="test_single_a",
+                    url=url_a,
+                    output_dir=self.test_dir.name,
+                    custom_filename="single_a.bin",
+                    connections=4,
+                    on_update=on_update_a,
+                )
+                await asyncio.wait_for(task_a.start(), timeout=5.0)
+            finally:
+                await runner_a.cleanup()
+
+            self.assertEqual(task_a.status, "completed")
+            self.assertFalse(task_a.supports_range)
+            self.assertEqual(task_a.total_size, len(payload_a))
+            self.assertEqual(task_a.bytes_downloaded, len(payload_a))
+            self.assertEqual(task_a.segments[0].status, "completed")
+            self.assertGreaterEqual(len(updates_a), 1)
+            self.assertTrue(
+                any(u["bytes_downloaded"] < len(payload_a) and u["segments"][0]["status"] == "downloading" for u in updates_a),
+                f"Se esperaba telemetría intermedia en downloading: {updates_a}",
+            )
+            with open(task_a.output_path, "rb") as f:
+                self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash_a)
+
+        # Sub-case B: pausa en flujo único (incluso bloqueado) deja estado paused y reanudar reinicia limpio sin >100%
+        with self.subTest("subcase_b_pause_and_restart_from_zero"):
+            payload_b = (b"SINGLE_STREAM_PAUSE_RESUME_CLEAN_0123456\n" * 14000)[:512 * 1024]
+            expected_hash_b = hashlib.sha256(payload_b).hexdigest()
+            mode_b = {"stall": True}
+
+            async def handle_b(request):
+                if request.method == "HEAD":
+                    return web.Response(headers={"Content-Length": str(len(payload_b))})
+                resp = web.StreamResponse(
+                    status=200,
+                    headers={"Content-Length": str(len(payload_b))},
+                )
+                await resp.prepare(request)
+                try:
+                    for idx, offset in enumerate(range(0, len(payload_b), 32768)):
+                        await resp.write(payload_b[offset:offset + 32768])
+                        if mode_b["stall"] and idx == 1:
+                            await asyncio.sleep(3.0)
+                    await resp.write_eof()
+                except (ConnectionResetError, BrokenPipeError, OSError, asyncio.CancelledError):
+                    pass
+                return resp
+
+            runner_b, url_b = await self._start_local_server(handle_b)
+            try:
+                task_b = DownloadTask(
+                    task_id="test_single_b",
+                    url=url_b,
+                    output_dir=self.test_dir.name,
+                    custom_filename="single_b.bin",
+                    connections=4,
+                )
+                start_job = asyncio.create_task(task_b.start())
+                deadline = time.monotonic() + 2.0
+                while task_b.bytes_downloaded == 0 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                await asyncio.wait_for(task_b.pause(), timeout=1.0)
+                await asyncio.wait_for(start_job, timeout=1.0)
+
+                self.assertEqual(task_b.status, "paused")
+                self.assertEqual(task_b.segments[0].status, "paused")
+                self.assertGreater(task_b.bytes_downloaded, 0)
+                self.assertLess(task_b.bytes_downloaded, len(payload_b))
+
+                mode_b["stall"] = False
+                await asyncio.wait_for(task_b.start(), timeout=5.0)
+            finally:
+                await runner_b.cleanup()
+
+            self.assertEqual(task_b.status, "completed")
+            self.assertEqual(task_b.segments[0].status, "completed")
+            self.assertEqual(task_b.bytes_downloaded, len(payload_b))
+            self.assertEqual(task_b.progress_percentage, 100.0)
+            with open(task_b.output_path, "rb") as f:
+                self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash_b)
+
+        # Sub-case C1: 404 en flujo único falla inmediatamente sin guardar HTML
+        with self.subTest("subcase_c1_404_immediate_error"):
+            c1_get_count = 0
+
+            async def handle_c1(request):
+                nonlocal c1_get_count
+                if request.method == "HEAD":
+                    return web.Response(headers={"Content-Length": "10000"})
+                c1_get_count += 1
+                return web.Response(status=404, text="<html>Not Found</html>")
+
+            runner_c1, url_c1 = await self._start_local_server(handle_c1)
+            try:
+                task_c1 = DownloadTask(
+                    task_id="test_single_c1",
+                    url=url_c1,
+                    output_dir=self.test_dir.name,
+                    custom_filename="single_c1.bin",
+                    connections=4,
+                )
+                await asyncio.wait_for(task_c1.start(), timeout=2.0)
+            finally:
+                await runner_c1.cleanup()
+
+            self.assertEqual(task_c1.status, "error")
+            self.assertIn("404", task_c1.error_message or "")
+            self.assertEqual(c1_get_count, 1)
+            self.assertFalse(os.path.exists(task_c1.output_path))
+
+        # Sub-case C2: EOF truncado en flujo único falla inmediatamente sin reintentar desde byte 0
+        with self.subTest("subcase_c2_truncated_eof_immediate_error"):
+            c2_get_count = 0
+
+            async def handle_c2(request):
+                nonlocal c2_get_count
+                if request.method == "HEAD":
+                    return web.Response(headers={"Content-Length": "10000"})
+                c2_get_count += 1
+                resp = web.StreamResponse(
+                    status=200,
+                    headers={"Content-Length": "10000"},
+                )
+                await resp.prepare(request)
+                await resp.write(b"X" * 1000)
+                if request.transport is not None:
+                    request.transport.close()
+                return resp
+
+            runner_c2, url_c2 = await self._start_local_server(handle_c2)
+            try:
+                task_c2 = DownloadTask(
+                    task_id="test_single_c2",
+                    url=url_c2,
+                    output_dir=self.test_dir.name,
+                    custom_filename="single_c2.bin",
+                    connections=4,
+                    retry_base_delay=0.01,
+                )
+                await asyncio.wait_for(task_c2.start(), timeout=2.0)
+            finally:
+                await runner_c2.cleanup()
+
+            self.assertEqual(task_c2.status, "error")
+            self.assertEqual(c2_get_count, 1)
+
+        # Sub-case D: 503 transitorio antes del byte 0 reintenta y tiene éxito al recuperarse (y acota si persiste)
+        with self.subTest("subcase_d_503_before_byte_zero_recovers"):
+            payload_d = (b"SINGLE_STREAM_503_RECOVER_OK\n" * 4000)[:100000]
+            expected_hash_d = hashlib.sha256(payload_d).hexdigest()
+            d_get_count = 0
+
+            async def handle_d(request):
+                nonlocal d_get_count
+                if request.method == "HEAD":
+                    return web.Response(headers={"Content-Length": str(len(payload_d))})
+                d_get_count += 1
+                if d_get_count == 1:
+                    return web.Response(status=503, text="Retry shortly")
+                return web.Response(
+                    status=200,
+                    body=payload_d,
+                    headers={"Content-Length": str(len(payload_d))},
+                )
+
+            runner_d, url_d = await self._start_local_server(handle_d)
+            try:
+                task_d = DownloadTask(
+                    task_id="test_single_d",
+                    url=url_d,
+                    output_dir=self.test_dir.name,
+                    custom_filename="single_d.bin",
+                    connections=4,
+                    retry_base_delay=0.01,
+                )
+                await asyncio.wait_for(task_d.start(), timeout=3.0)
+            finally:
+                await runner_d.cleanup()
+
+            self.assertEqual(task_d.status, "completed")
+            self.assertEqual(d_get_count, 2)
+            with open(task_d.output_path, "rb") as f:
+                self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash_d)
+
+            d2_get_count = 0
+
+            async def handle_d2(request):
+                nonlocal d2_get_count
+                if request.method == "HEAD":
+                    return web.Response(headers={"Content-Length": str(len(payload_d))})
+                d2_get_count += 1
+                return web.Response(status=503, text="Always 503")
+
+            runner_d2, url_d2 = await self._start_local_server(handle_d2)
+            try:
+                task_d2 = DownloadTask(
+                    task_id="test_single_d2",
+                    url=url_d2,
+                    output_dir=self.test_dir.name,
+                    custom_filename="single_d2.bin",
+                    connections=4,
+                    retry_base_delay=0.01,
+                )
+                await asyncio.wait_for(task_d2.start(), timeout=3.0)
+            finally:
+                await runner_d2.cleanup()
+
+            self.assertEqual(task_d2.status, "error")
+            self.assertEqual(d2_get_count, 6)
+
+    async def test_worker_write_oserror_fails_fatally_without_retrying(self):
+        """Verifica que OSError de disco en _write_chunk aborte fatalmente sin reintentar tras avanzar offset."""
+        payload_size = 128 * 1024
+        payload = b"DISK_WRITE_ERROR_GUARD_DATA" * 5000
+        payload = payload[:payload_size]
+        get_count = 0
+
+        async def handle(request):
+            nonlocal get_count
+            if request.method == "HEAD":
+                return web.Response(
+                    headers={
+                        "Accept-Ranges": "bytes",
+                        "Content-Length": str(payload_size),
+                    }
+                )
+            get_count += 1
+            range_header = request.headers.get("Range", "bytes=0-")
+            start_s, end_s = range_header[6:].split("-")
+            start = int(start_s)
+            end = min(int(end_s) if end_s else payload_size - 1, payload_size - 1)
+            chunk = payload[start:end + 1]
+            return web.Response(
+                status=206,
+                body=chunk,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{payload_size}",
+                    "Content-Length": str(len(chunk)),
+                    "Accept-Ranges": "bytes",
+                },
+            )
+
+        runner, url = await self._start_local_server(handle)
+        try:
+            task = DownloadTask(
+                task_id="test_disk_oserror",
+                url=url,
+                output_dir=self.test_dir.name,
+                custom_filename="disk_err.bin",
+                connections=2,
+            )
+            with patch.object(task, "_write_chunk", side_effect=OSError("No space left on device")):
+                await asyncio.wait_for(task.start(), timeout=2.0)
+        finally:
+            await runner.cleanup()
+
+        self.assertEqual(task.status, "error")
+        self.assertTrue(task.error_message)
+        self.assertLessEqual(get_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -11,9 +11,14 @@ import time
 import asyncio
 import aiohttp
 from typing import Dict, List, Optional, Callable
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 
 from core.segment import Segment
+from core.security import (
+    validate_custom_filename,
+    sanitize_remote_filename,
+    ensure_within_directory,
+)
 
 MIN_SPLIT_CHUNK = 2 * 1024 * 1024  # 2MB mínimo para dividir un segmento
 BUFFER_SIZE = 64 * 1024            # 64KB por paquete de lectura
@@ -69,14 +74,24 @@ class DownloadTask:
         self.task_id = task_id
         self.url = url
         self.output_dir = output_dir
-        self.custom_filename = custom_filename
+        if custom_filename is not None:
+            self.custom_filename = validate_custom_filename(custom_filename)
+            self.filename = self.custom_filename
+            self._filename_resolved = True
+        else:
+            self.custom_filename = None
+            self.filename = "download.bin"
+            self._filename_resolved = False
+
         self.connections = max(1, min(connections, 32))
         self.speed_limit_bps = speed_limit_bps
         self.rate_limiter = RateLimiter(speed_limit_bps)
         self.on_update = on_update
 
-        self.filename = custom_filename or "download.bin"
-        self.output_path = os.path.join(output_dir, self.filename)
+        self.output_path = ensure_within_directory(
+            self.output_dir,
+            os.path.join(self.output_dir, self.filename),
+        )
         self.meta_path = self.output_path + ".aether.json"
         
         self.total_size: int = 0
@@ -94,6 +109,7 @@ class DownloadTask:
         
         self._workers: List[asyncio.Task] = []
         self._lock = asyncio.Lock()
+        self._io_lock = asyncio.Lock()
         self._stop_event = asyncio.Event()
         self._file_handle = None
 
@@ -145,37 +161,43 @@ class DownloadTask:
             return False
 
     def _parse_headers(self, resp: aiohttp.ClientResponse):
-        # Resolver nombre de archivo
-        if not self.custom_filename:
-            # Revisar Content-Disposition
+        # Resolver nombre de archivo una sola vez (preservando fallbacks en reanudación)
+        if not self.custom_filename and not self._filename_resolved:
             cd = resp.headers.get("Content-Disposition", "")
-            match = re.search(r'filename\*?=(?:UTF-8\'\')?["\']?([^"\';\n]+)["\']?', cd, re.IGNORECASE)
+            match = re.search(
+                r'filename\*?=(?:UTF-8\'[^\']*\')?["\']?([^"\';\r\n]+)["\']?',
+                cd,
+                re.IGNORECASE,
+            )
             if match:
-                self.filename = unquote(match.group(1).strip())
+                raw_name = match.group(1).strip()
             else:
                 path = urlparse(str(resp.url)).path
-                name = os.path.basename(path)
-                self.filename = unquote(name) if name else f"download_{int(time.time())}.bin"
-            
-            # Sanitizar nombre (Splinter Checkpoint)
-            self.filename = re.sub(r'[\\/*?:"<>|]', "_", self.filename)
-            self.output_path = os.path.join(self.output_dir, self.filename)
+                raw_name = os.path.basename(path)
+
+            fallback = f"download_{int(time.time())}.bin"
+            self.filename = sanitize_remote_filename(raw_name, fallback=fallback)
+            self.output_path = ensure_within_directory(
+                self.output_dir,
+                os.path.join(self.output_dir, self.filename),
+            )
             self.meta_path = self.output_path + ".aether.json"
+            self._filename_resolved = True
 
-        # Content-Range o Content-Length
+        # Actualizar tamaño y capacidades Range de forma incondicional desde las cabeceras actuales
+        self.supports_range = False
         cr = resp.headers.get("Content-Range", "")
-        if cr:
-            match = re.search(r'/(\d+)', cr)
-            if match:
-                self.total_size = int(match.group(1))
-                self.supports_range = True
+        cr_match = re.search(r'/(\d+)', cr) if cr else None
+        cl = resp.headers.get("Content-Length")
+        if cr_match:
+            self.total_size = int(cr_match.group(1))
+            self.supports_range = True
+        elif not cr and cl and cl.isdigit():
+            self.total_size = int(cl)
+        else:
+            self.total_size = 0
 
-        if not self.total_size:
-            cl = resp.headers.get("Content-Length")
-            if cl and cl.isdigit():
-                self.total_size = int(cl)
-
-        if resp.headers.get("Accept-Ranges", "").lower() == "bytes":
+        if resp.headers.get("Accept-Ranges", "").strip().lower() == "bytes":
             self.supports_range = True
 
         self.etag = resp.headers.get("ETag")
@@ -184,10 +206,11 @@ class DownloadTask:
         """Inicializa los segmentos iniciales."""
         self.segments = []
         if self.supports_range and self.total_size > 0:
-            chunk_size = self.total_size // self.connections
-            for i in range(self.connections):
+            num_conns = min(self.connections, self.total_size)
+            chunk_size = self.total_size // num_conns
+            for i in range(num_conns):
                 start = i * chunk_size
-                end = self.total_size - 1 if i == self.connections - 1 else ((i + 1) * chunk_size - 1)
+                end = self.total_size - 1 if i == num_conns - 1 else ((i + 1) * chunk_size - 1)
                 self.segments.append(Segment(
                     id=i,
                     start_byte=start,
@@ -205,8 +228,36 @@ class DownloadTask:
                 status="pending"
             ))
 
+    async def _write_chunk(self, offset: int, data: bytes) -> None:
+        """Escribe un bloque en el desplazamiento exacto usando pwrite en POSIX o lock dedicado en Windows."""
+        if not data:
+            return
+        if hasattr(os, "pwrite"):
+            fd = self._file_handle.fileno()
+            written = 0
+            total = len(data)
+            while written < total:
+                buf = data if written == 0 else memoryview(data)[written:]
+                n = os.pwrite(fd, buf, offset + written)
+                if n <= 0:
+                    raise OSError("os.pwrite wrote 0 bytes")
+                written += n
+        else:
+            async with self._io_lock:
+                self._file_handle.seek(offset)
+                self._file_handle.write(data)
+
+    def _cleanup_meta_files(self) -> None:
+        """Elimina archivos de metadatos (.aether.json y .tmp) si existen."""
+        for path in (self.meta_path, f"{self.meta_path}.tmp"):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
     def _save_state(self):
-        """Persiste el estado de los segmentos en disco."""
+        """Persiste el estado de los segmentos en disco de forma atómica."""
         if not self.supports_range or self.total_size <= 0:
             return
         state = {
@@ -217,31 +268,51 @@ class DownloadTask:
             "etag": self.etag,
             "segments": [s.to_dict() for s in self.segments]
         }
+        tmp_path = f"{self.meta_path}.tmp"
         try:
-            with open(self.meta_path, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(state, f, indent=2)
+                f.flush()
+            os.replace(tmp_path, self.meta_path)
         except Exception:
-            pass
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
     def _load_state(self) -> bool:
-        """Carga el estado previo si existe para reanudar."""
+        """Carga el estado previo si existe para reanudar, validando ETag y restaurando bytes."""
         if not os.path.exists(self.meta_path) or not os.path.exists(self.output_path):
             return False
         try:
             with open(self.meta_path, "r", encoding="utf-8") as f:
                 state = json.load(f)
-            if state.get("total_size") == self.total_size and state.get("url") == self.url:
-                self.segments = [
-                    Segment(
-                        id=s["id"],
-                        start_byte=s["start_byte"],
-                        current_byte=s["current_byte"],
-                        end_byte=s["end_byte"],
-                        status="paused" if s["current_byte"] <= s["end_byte"] else "completed"
-                    )
-                    for s in state.get("segments", [])
-                ]
-                return True
+            if state.get("total_size") != self.total_size or state.get("url") != self.url:
+                return False
+            saved_etag = state.get("etag")
+            if saved_etag and self.etag and saved_etag != self.etag:
+                return False
+            raw_segments = state.get("segments", [])
+            if not raw_segments:
+                return False
+            self.segments = [
+                Segment(
+                    id=s["id"],
+                    start_byte=s["start_byte"],
+                    current_byte=s["current_byte"],
+                    end_byte=s["end_byte"],
+                    status="paused" if s["current_byte"] <= s["end_byte"] else "completed",
+                    bytes_downloaded=max(0, min(s["current_byte"], s["end_byte"] + 1) - s["start_byte"]),
+                )
+                for s in raw_segments
+            ]
+            self.bytes_downloaded = sum(
+                max(0, min(s.current_byte, s.end_byte + 1) - s.start_byte)
+                for s in self.segments
+            )
+            self.last_sample_bytes = self.bytes_downloaded
+            return True
         except Exception:
             pass
         return False
@@ -250,74 +321,116 @@ class DownloadTask:
         """Inicia o reanuda la descarga acelerada."""
         self._stop_event.clear()
         self.status = "downloading"
+        self.error_message = None
+        self.speed_bps = 0.0
         self.start_time = time.time()
         self.last_sample_time = self.start_time
         self.last_sample_bytes = self.bytes_downloaded
+        self._workers = []
 
         os.makedirs(self.output_dir, exist_ok=True)
 
         connector = aiohttp.TCPConnector(limit=64)
         async with aiohttp.ClientSession(connector=connector) as session:
-            # 1. Sondear si es primera vez
-            if self.total_size == 0:
-                success = await self.probe(session)
-                if not success:
-                    self.status = "error"
-                    return
+            # 1. Sondear siempre para obtener ETag, tamaño y soporte Range actuales
+            success = await self.probe(session)
+            if not success:
+                self.status = "paused" if self._stop_event.is_set() else "error"
+                return
 
-            # 2. Asignación de archivo en Linux (truncate para evitar bloqueos)
-            if not self._load_state():
-                self._init_segments()
-                # Pre-asignar tamaño del archivo
-                with open(self.output_path, "wb") as f:
-                    if self.total_size > 0:
+            if self._stop_event.is_set():
+                self.status = "paused"
+                return
+
+            # 2. Rama con Range y tamaño conocido
+            if self.supports_range and self.total_size > 0:
+                if not self._load_state():
+                    self.bytes_downloaded = 0
+                    self.last_sample_bytes = 0
+                    self._init_segments()
+                    # Pre-asignar tamaño del archivo
+                    with open(self.output_path, "wb") as f:
                         f.truncate(self.total_size)
 
-            # Abrir archivo para escrituras concurrentes
-            self._file_handle = open(self.output_path, "r+b")
+                # Abrir archivo para escrituras concurrentes
+                self._file_handle = open(self.output_path, "r+b")
 
-            try:
-                # 3. Lanzar workers
-                if self.supports_range and len(self.segments) > 1:
+                try:
                     self._workers = [
                         asyncio.create_task(self._worker(session, seg))
                         for seg in self.segments
                     ]
-                    # Tarea de balanceo dinámico de segmentos (estilo IDM)
                     balancer = asyncio.create_task(self._dynamic_balancer(session))
                     speed_sampler = asyncio.create_task(self._speed_sampler())
 
-                    await asyncio.gather(*self._workers, return_exceptions=True)
-                    balancer.cancel()
-                    speed_sampler.cancel()
-                else:
-                    # Descarga lineal simple
-                    await self._single_stream_download(session)
+                    # Drenar todos los workers, incluidos los añadidos dinámicamente
+                    while True:
+                        pending = [w for w in self._workers if not w.done()]
+                        if not pending:
+                            break
+                        await asyncio.gather(*pending, return_exceptions=True)
 
-                # Verificar finalización
-                all_done = all(s.current_byte > s.end_byte for s in self.segments)
-                if all_done and not self._stop_event.is_set():
-                    self.status = "completed"
-                    self.speed_bps = 0.0
-                    if os.path.exists(self.meta_path):
-                        os.remove(self.meta_path)
-            finally:
-                if self._file_handle:
-                    self._file_handle.close()
-                    self._file_handle = None
-                self._save_state()
+                    balancer.cancel()
+                    await asyncio.gather(balancer, return_exceptions=True)
+
+                    stragglers = [w for w in self._workers if not w.done()]
+                    if stragglers:
+                        await asyncio.gather(*stragglers, return_exceptions=True)
+
+                    speed_sampler.cancel()
+                    await asyncio.gather(speed_sampler, return_exceptions=True)
+
+                    all_done = all(s.current_byte > s.end_byte for s in self.segments)
+                    if all_done and not self._stop_event.is_set():
+                        self.status = "completed"
+                        self.speed_bps = 0.0
+                finally:
+                    if self._file_handle:
+                        try:
+                            self._file_handle.flush()
+                        except Exception:
+                            pass
+                        self._file_handle.close()
+                        self._file_handle = None
+
+                    if self.status == "completed":
+                        self._cleanup_meta_files()
+                    else:
+                        self._save_state()
+            else:
+                # Rama de flujo único sin Range o sin Content-Length
+                self.bytes_downloaded = 0
+                self.last_sample_bytes = 0
+                self._init_segments()
+                speed_sampler = asyncio.create_task(self._speed_sampler())
+                try:
+                    await self._single_stream_download(session)
+                    if (
+                        self.segments
+                        and self.segments[0].status == "completed"
+                        and not self._stop_event.is_set()
+                    ):
+                        self.status = "completed"
+                        self.speed_bps = 0.0
+                        self._cleanup_meta_files()
+                finally:
+                    speed_sampler.cancel()
+                    await asyncio.gather(speed_sampler, return_exceptions=True)
 
     async def _worker(self, session: aiohttp.ClientSession, segment: Segment):
         """Worker individual que descarga un rango específico."""
         while not self._stop_event.is_set():
-            if segment.current_byte > segment.end_byte:
-                segment.status = "completed"
-                break
+            async with self._lock:
+                if segment.current_byte > segment.end_byte:
+                    segment.status = "completed"
+                    break
+                req_start = segment.current_byte
+                req_end = segment.end_byte
+                segment.status = "downloading"
 
-            segment.status = "downloading"
             headers = {
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) Aether/1.0",
-                "Range": f"bytes={segment.current_byte}-{segment.end_byte}"
+                "Range": f"bytes={req_start}-{req_end}"
             }
 
             try:
@@ -332,27 +445,48 @@ class DownloadTask:
                         if not chunk:
                             break
 
-                        # Escribir en posición exacta del archivo
                         async with self._lock:
-                            self._file_handle.seek(segment.current_byte)
-                            self._file_handle.write(chunk)
-                            self._file_handle.flush()
+                            remaining = segment.end_byte - segment.current_byte + 1
+                            if remaining <= 0:
+                                segment.status = "completed"
+                                break
+                            if len(chunk) > remaining:
+                                chunk = chunk[:remaining]
+                            offset = segment.current_byte
+                            chunk_len = len(chunk)
+                            segment.update_progress(chunk_len)
+                            self.bytes_downloaded += chunk_len
+                            seg_done = segment.current_byte > segment.end_byte
 
-                        chunk_len = len(chunk)
-                        segment.update_progress(chunk_len)
-                        self.bytes_downloaded += chunk_len
+                        await self._write_chunk(offset, chunk)
                         await self.rate_limiter.consume(chunk_len)
 
-                    if segment.current_byte > segment.end_byte:
-                        segment.status = "completed"
-                        break
+                        if seg_done:
+                            break
+
+                    async with self._lock:
+                        if segment.current_byte > segment.end_byte:
+                            segment.status = "completed"
+                            break
+                        if self._stop_event.is_set() and segment.status != "error":
+                            segment.status = "paused"
+                            break
 
             except asyncio.CancelledError:
-                segment.status = "paused"
+                if segment.current_byte > segment.end_byte:
+                    segment.status = "completed"
+                else:
+                    segment.status = "paused"
                 break
             except Exception:
+                if self._stop_event.is_set():
+                    segment.status = "paused"
+                    break
                 segment.status = "reconnecting"
                 await asyncio.sleep(1)
+
+        if self._stop_event.is_set() and segment.status not in ("completed", "error"):
+            segment.status = "paused"
 
     async def _dynamic_balancer(self, session: aiohttp.ClientSession):
         """
@@ -363,6 +497,8 @@ class DownloadTask:
         while not self._stop_event.is_set():
             await asyncio.sleep(1.0)
             async with self._lock:
+                if self._stop_event.is_set():
+                    break
                 completed = [s for s in self.segments if s.status == "completed"]
                 active = [s for s in self.segments if s.status == "downloading"]
 
@@ -408,8 +544,8 @@ class DownloadTask:
                     seg.update_progress(chunk_len)
                     self.bytes_downloaded += chunk_len
                     await self.rate_limiter.consume(chunk_len)
-                    
-        seg.status = "completed"
+
+        seg.status = "paused" if self._stop_event.is_set() else "completed"
 
     async def _speed_sampler(self):
         """Muestra y calcula la velocidad global promedio cada 500ms."""
@@ -436,12 +572,27 @@ class DownloadTask:
 
     async def pause(self):
         """Pausa la descarga de forma limpia."""
+        if self.status == "completed":
+            return
         self._stop_event.set()
-        for w in self._workers:
-            w.cancel()
-        self.status = "paused"
-        self.speed_bps = 0.0
-        self._save_state()
+        while True:
+            pending = [w for w in self._workers if not w.done()]
+            if not pending:
+                break
+            for w in pending:
+                w.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        if self._file_handle and not self._file_handle.closed:
+            try:
+                self._file_handle.flush()
+            except Exception:
+                pass
+
+        if self.status != "completed":
+            self.status = "paused"
+            self.speed_bps = 0.0
+            self._save_state()
 
     def to_dict(self) -> dict:
         return {

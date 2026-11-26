@@ -1,7 +1,7 @@
 """
 Aether Download Accelerator - Core Download Engine
-Arquitectura Donatello: Asincronía pura con aiohttp, segmentación dinámica y escritura no bloqueante.
-Control Splinter: Verificación estricta de límites, fallback de servidor y persistencia.
+Asincronía pura con aiohttp, segmentación dinámica y escritura concurrente segura.
+Verificación estricta de límites, validación de ETag, fallback lineal y persistencia atómica.
 """
 
 import os

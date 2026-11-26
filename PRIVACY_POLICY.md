@@ -13,6 +13,7 @@ The Extension requests the following permissions strictly for functional integra
 *   **`downloads`**: Required to intercept native browser file downloads and forward the download URL to the local Aether accelerator engine (`http://127.0.0.1:8765`).
 *   **`contextMenus`**: Allows users to right-click on web links and media files to trigger accelerated downloads via the "Descargar con Aether" action.
 *   **`storage`**: Used exclusively on the user's local machine to persist user preferences (e.g., active thread count, automatic interception toggle).
+*   **`activeTab`**: Used only when the user interacts with the extension to access the active tab context for media detection and download handoff.
 *   **`Host Permissions (<all_urls>)`**: Necessary for the content script to detect HTML5 `<video>` and `<source>` streaming media elements across websites to display the optional floating download button.
 
 ## 3. Data Transmission

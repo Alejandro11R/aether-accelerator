@@ -1,6 +1,6 @@
 """
 Aether Download Accelerator - Test Suite
-Raphael (QA & TDD) + Maestro Splinter (Integridad de datos y Cero Regresiones)
+Pruebas unitarias y de integración del motor de descargas (integridad de datos y cero regresiones).
 Verifica la matemática de segmentación, particionado dinámico, pausa/reanudación y checksum SHA-256.
 """
 
@@ -188,7 +188,7 @@ class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(os.path.exists(output_file))
         self.assertEqual(os.path.getsize(output_file), self.data_size)
 
-        # Verificación estricta de hash SHA-256 (Splinter Checkpoint)
+        # Verificación estricta de hash SHA-256
         with open(output_file, "rb") as f:
             actual_hash = hashlib.sha256(f.read()).hexdigest()
         self.assertEqual(actual_hash, self.expected_hash, "El hash SHA-256 descargado debe coincidir exactamente!")

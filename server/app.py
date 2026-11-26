@@ -8,6 +8,7 @@ import re
 import json
 import platform
 import subprocess
+import threading
 from typing import Callable, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from aiohttp import web, WSMsgType, WSCloseCode
@@ -212,14 +213,16 @@ def _open_folder_native(path: str) -> None:
     current_platform = _get_platform_key()
     if current_platform == "windows":
         os.startfile(path)  # type: ignore[attr-defined]
-    elif current_platform == "darwin":
-        subprocess.Popen(["open", path])
-    else:
-        subprocess.Popen(
-            ["xdg-open", path],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        return
+    cmd = ["open", path] if current_platform == "darwin" else ["xdg-open", path]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    threading.Thread(target=proc.wait, daemon=True).start()
 
 
 def create_app(

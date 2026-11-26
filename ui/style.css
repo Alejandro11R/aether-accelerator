@@ -886,6 +886,14 @@ body {
   background: #00f2fe;
 }
 
+[data-theme="cyber"] .segment-band-cell.paused {
+  border-color: rgba(245, 158, 11, 0.55);
+}
+
+[data-theme="cyber"] .segment-band-cell.error {
+  border-color: rgba(239, 68, 68, 0.75);
+}
+
 /* Tema OLED Frost: distinción accesible por trama diagonal y bordes, no solo color */
 [data-theme="oled"] .segment-band {
   background: #050505;
@@ -1092,6 +1100,8 @@ body {
 .modal-glass-card {
   width: 100%;
   max-width: 560px;
+  max-height: calc(100vh - 2.5rem);
+  overflow-y: auto;
   border-radius: var(--radius-xl);
   padding: 1.85rem 2rem;
   animation: modal-enter 0.22s cubic-bezier(0.16, 1, 0.3, 1);

@@ -9,6 +9,7 @@ import sys
 import asyncio
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import aiohttp
@@ -1028,22 +1029,41 @@ class TestCrossPlatformSystemHelpers(unittest.TestCase):
 
     def test_open_folder_native_uses_platform_opener_without_shell(self):
         target = "/tmp/aether-test-dir"
+        real_thread_cls = threading.Thread
 
-        with patch("server.app.platform.system", return_value="Linux"), patch(
-            "server.app.subprocess.Popen"
-        ) as mock_popen:
-            server_app._open_folder_native(target)
-        mock_popen.assert_called_once_with(
-            ["xdg-open", target],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        for os_name, expected_cmd in [
+            ("Linux", ["xdg-open", target]),
+            ("Darwin", ["open", target]),
+        ]:
+            with self.subTest(os_name=os_name):
+                spawned_threads = []
 
-        with patch("server.app.platform.system", return_value="Darwin"), patch(
-            "server.app.subprocess.Popen"
-        ) as mock_popen:
-            server_app._open_folder_native(target)
-        mock_popen.assert_called_once_with(["open", target])
+                def _track_thread(*args, _threads=spawned_threads, **kwargs):
+                    thread = real_thread_cls(*args, **kwargs)
+                    _threads.append(thread)
+                    return thread
+
+                with patch("server.app.platform.system", return_value=os_name), patch(
+                    "server.app.subprocess.Popen"
+                ) as mock_popen, patch(
+                    "server.app.threading.Thread",
+                    side_effect=_track_thread,
+                ):
+                    server_app._open_folder_native(target)
+
+                mock_popen.assert_called_once_with(
+                    expected_cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                self.assertEqual(len(spawned_threads), 1)
+                reaper = spawned_threads[0]
+                self.assertTrue(reaper.daemon)
+                reaper.join(timeout=2.0)
+                self.assertFalse(reaper.is_alive())
+                mock_popen.return_value.wait.assert_called_once_with()
 
         with patch("server.app.platform.system", return_value="Windows"), patch(
             "server.app.os.startfile",

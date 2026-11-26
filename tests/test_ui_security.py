@@ -622,6 +622,63 @@ class TestUiSecurity(unittest.TestCase):
                 self.assertNotIn("~/Descargas", el["attrs"].get("value", ""))
                 self.assertNotIn("~/Descargas", el["text"])
 
+        # Static CSS checks: Cyber segment status specificity (0,3,0) and modal viewport fit
+        css_no_comments = re.sub(r"/\*.*?\*/", "", self.css_source, flags=re.DOTALL)
+
+        def _extract_rule_body(selector):
+            pattern = re.compile(
+                rf"(?:^|\}})\s*{re.escape(selector)}\s*\{{([^}}]*)\}}",
+            )
+            match = pattern.search(css_no_comments)
+            self.assertIsNotNone(match, msg=f"Missing CSS rule for {selector!r}")
+            return match.group(1), match.start()
+
+        with self.subTest("cyber_segment_band_specificity"):
+            cyber_base_body, cyber_base_pos = _extract_rule_body('[data-theme="cyber"] .segment-band-cell')
+            cyber_base_border = re.search(r"border-color\s*:\s*([^;]+);", cyber_base_body)
+            self.assertIsNotNone(cyber_base_border)
+
+            cyber_paused_body, cyber_paused_pos = _extract_rule_body(
+                '[data-theme="cyber"] .segment-band-cell.paused'
+            )
+            self.assertGreater(cyber_paused_pos, cyber_base_pos)
+            cyber_paused_border = re.search(r"border-color\s*:\s*([^;]+);", cyber_paused_body)
+            self.assertIsNotNone(cyber_paused_border, msg="Cyber paused segment rule must set border-color")
+            self.assertNotEqual(
+                cyber_paused_border.group(1).strip(),
+                cyber_base_border.group(1).strip(),
+            )
+            self.assertRegex(cyber_paused_border.group(1), r"(?:245,\s*158,\s*11|--accent-amber|#f59e0b)")
+
+            cyber_error_body, cyber_error_pos = _extract_rule_body(
+                '[data-theme="cyber"] .segment-band-cell.error'
+            )
+            self.assertGreater(cyber_error_pos, cyber_base_pos)
+            cyber_error_border = re.search(r"border-color\s*:\s*([^;]+);", cyber_error_body)
+            self.assertIsNotNone(cyber_error_border, msg="Cyber error segment rule must set border-color")
+            self.assertNotEqual(
+                cyber_error_border.group(1).strip(),
+                cyber_base_border.group(1).strip(),
+            )
+            self.assertNotEqual(
+                cyber_error_border.group(1).strip(),
+                cyber_paused_border.group(1).strip(),
+            )
+            self.assertRegex(cyber_error_border.group(1), r"(?:239,\s*68,\s*68|--accent-danger|#ef4444)")
+
+        with self.subTest("modal_glass_card_viewport_fit"):
+            modal_card_body, _ = _extract_rule_body(".modal-glass-card")
+            self.assertRegex(
+                modal_card_body,
+                r"max-height\s*:\s*calc\(\s*100vh\s*-\s*2\.5rem\s*\)\s*;",
+                msg=".modal-glass-card must constrain max-height to calc(100vh - 2.5rem)",
+            )
+            self.assertRegex(
+                modal_card_body,
+                r"overflow-y\s*:\s*auto\s*;",
+                msg=".modal-glass-card must enable vertical scrolling when viewport is short",
+            )
+
     def test_dom_xss_invariance_safe_percent_status_and_id_encoding(self):
         test_js = r"""
 const maliciousTask = {
@@ -1090,6 +1147,58 @@ process.stdout.write(JSON.stringify({
         del_call = next((c for c in data["fetchCalls"] if c["method"] == "DELETE"), None)
         self.assertIsNotNone(del_call)
         self.assertEqual(del_call["url"], "/api/downloads/task-err-1?delete_file=true")
+
+    def test_live_limit_select_reverts_on_network_failure(self):
+        test_js = r"""
+const task = {
+  id: "net-err-task-1",
+  filename: "archive.tar.gz",
+  url: "https://example.com/archive.tar.gz",
+  status: "downloading",
+  speed_limit_bps: 1048576,
+  bytes_downloaded: 100,
+  total_size: 1000,
+  progress: 10,
+  speed_bps: 524288,
+  eta_seconds: 2,
+  connections: 4,
+  supports_range: true,
+  segments: [],
+};
+
+sendWs({ type: "init", download_dir: "/tmp/aether", downloads: [task] });
+const card = mockDocument.getElementById("downloads-list").children[0];
+const limitSelect = card.querySelector(".row-limit-select");
+const initialValue = limitSelect.value;
+
+fetchHandler = async () => {
+  throw new Error("Network down");
+};
+
+limitSelect.focus();
+limitSelect.value = "5242880";
+limitSelect.dispatchEvent("change");
+await flushMicrotasks();
+
+const errorToasts = mockDocument
+  .getElementById("toast-container")
+  .querySelectorAll(".toast-error")
+  .map((t) => ({ role: t.getAttribute("role"), text: t.textContent }));
+
+process.stdout.write(JSON.stringify({
+  consoleErrors,
+  initialValue,
+  revertedValue: limitSelect.value,
+  errorToasts,
+}));
+"""
+        data = self._run_node_test(test_js)
+        self.assertEqual(data["consoleErrors"], [])
+        self.assertEqual(data["initialValue"], "1048576")
+        self.assertEqual(data["revertedValue"], "1048576")
+        self.assertEqual(len(data["errorToasts"]), 1)
+        self.assertEqual(data["errorToasts"][0]["role"], "alert")
+        self.assertIn("Network down", data["errorToasts"][0]["text"])
 
 
 if __name__ == "__main__":

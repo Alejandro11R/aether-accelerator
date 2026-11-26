@@ -1100,6 +1100,10 @@ document.addEventListener("DOMContentLoaded", () => {
         }
       } catch (err) {
         showToast("Error al actualizar límite: " + err.message, "error");
+        syncLimitSelectOptions(
+          refs,
+          Math.max(0, Number(refs.lastTask && refs.lastTask.speed_limit_bps) || 0)
+        );
       }
     });
 

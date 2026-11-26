@@ -12,7 +12,7 @@
 
 <br/>
 
-Aether es una alternativa de código abierto a gestores de descargas como Internet Download Manager (IDM) y XDM. Está construido sobre un motor asíncrono en Python con `aiohttp` y una interfaz web ligera de cristal estático (*Static-Glass*) pensada para **Linux (Hyprland / Wayland / X11)**, **Windows** y **macOS**.
+Aether es una alternativa de código abierto a gestores de descargas. Está construido sobre un motor asíncrono en Python con `aiohttp` y una interfaz web ligera de cristal estático (*Static-Glass*) pensada para **Linux (Hyprland / Wayland / X11)**, **Windows** y **macOS**.
 
 </div>
 

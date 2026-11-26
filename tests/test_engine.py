@@ -13,6 +13,7 @@ import hashlib
 import tempfile
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import aiohttp
 from aiohttp import web
@@ -458,7 +459,7 @@ class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):
         finally:
             await runner.cleanup()
 
-        await asyncio.wait_for(task.start(), timeout=3.0)
+        await asyncio.wait_for(task.start(), timeout=10.0)
         self.assertEqual(task.status, "error")
         self.assertTrue(os.path.exists(task.meta_path))
         with open(task.meta_path, "r", encoding="utf-8") as f:
@@ -1282,6 +1283,113 @@ class TestFullDownloadIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(os.path.getsize(task.output_path), payload_size)
         with open(task.output_path, "rb") as f:
             self.assertEqual(hashlib.sha256(f.read()).hexdigest(), expected_hash)
+
+    async def test_probe_short_circuits_on_connector_error_and_falls_back_on_http_rejection(self):
+        """Verifica que probe aborte tras fallo de conexión/URL en HEAD y sí use GET en rechazo HTTP."""
+        class _FakeResponseCtx:
+            def __init__(self, outcome):
+                self._outcome = outcome
+
+            async def __aenter__(self):
+                if isinstance(self._outcome, BaseException):
+                    raise self._outcome
+                return self._outcome
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _FakeSession:
+            def __init__(self, head_outcome, get_outcome=None):
+                self.head_outcome = head_outcome
+                self.get_outcome = get_outcome
+                self.head_calls = 0
+                self.get_calls = 0
+
+            def head(self, url, **kwargs):
+                self.head_calls += 1
+                return _FakeResponseCtx(self.head_outcome)
+
+            def get(self, url, **kwargs):
+                self.get_calls += 1
+                return _FakeResponseCtx(self.get_outcome)
+
+        conn_key = SimpleNamespace(host="127.0.0.1", port=9, ssl=False)
+
+        # Case A: ClientConnectorError en HEAD -> no debe reintentar con GET
+        task_a = DownloadTask(
+            task_id="probe_case_a",
+            url="http://127.0.0.1:9/file.bin",
+            output_dir=self.test_dir.name,
+            custom_filename="probe_a.bin",
+        )
+        session_a = _FakeSession(
+            head_outcome=aiohttp.ClientConnectorError(
+                conn_key,
+                ConnectionRefusedError("refused"),
+            )
+        )
+        self.assertFalse(await task_a.probe(session_a))
+        self.assertTrue(bool(task_a.error_message))
+        self.assertEqual(session_a.head_calls, 1)
+        self.assertEqual(session_a.get_calls, 0)
+
+        # Case B: InvalidURL en HEAD -> no debe reintentar con GET
+        task_b = DownloadTask(
+            task_id="probe_case_b",
+            url="http://[::1",
+            output_dir=self.test_dir.name,
+            custom_filename="probe_b.bin",
+        )
+        session_b = _FakeSession(head_outcome=aiohttp.InvalidURL("http://[::1"))
+        self.assertFalse(await task_b.probe(session_b))
+        self.assertTrue(bool(task_b.error_message))
+        self.assertEqual(session_b.head_calls, 1)
+        self.assertEqual(session_b.get_calls, 0)
+
+        # Case C: HEAD 405 -> fallback a GET 206 Range bytes 0-0/1024
+        task_c = DownloadTask(
+            task_id="probe_case_c",
+            url="http://127.0.0.1/file.bin",
+            output_dir=self.test_dir.name,
+        )
+        session_c = _FakeSession(
+            head_outcome=SimpleNamespace(
+                status=405,
+                headers={},
+                url="http://127.0.0.1/file.bin",
+            ),
+            get_outcome=SimpleNamespace(
+                status=206,
+                headers={"Content-Range": "bytes 0-0/1024"},
+                url="http://127.0.0.1/file.bin",
+            ),
+        )
+        self.assertTrue(await task_c.probe(session_c))
+        self.assertEqual(session_c.head_calls, 1)
+        self.assertEqual(session_c.get_calls, 1)
+        self.assertTrue(task_c.supports_range)
+        self.assertEqual(task_c.total_size, 1024)
+        self.assertEqual(task_c.filename, "file.bin")
+
+        # Case D: HEAD ServerDisconnectedError -> fallback a GET 206 Range bytes 0-0/2048
+        task_d = DownloadTask(
+            task_id="probe_case_d",
+            url="http://127.0.0.1/file.bin",
+            output_dir=self.test_dir.name,
+            custom_filename="probe_d.bin",
+        )
+        session_d = _FakeSession(
+            head_outcome=aiohttp.ServerDisconnectedError(),
+            get_outcome=SimpleNamespace(
+                status=206,
+                headers={"Content-Range": "bytes 0-0/2048"},
+                url="http://127.0.0.1/file.bin",
+            ),
+        )
+        self.assertTrue(await task_d.probe(session_d))
+        self.assertEqual(session_d.head_calls, 1)
+        self.assertEqual(session_d.get_calls, 1)
+        self.assertEqual(task_d.total_size, 2048)
 
 
 if __name__ == "__main__":

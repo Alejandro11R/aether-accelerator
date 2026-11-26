@@ -137,13 +137,17 @@ class DownloadTask:
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Aether/1.0",
             "Accept": "*/*"
         }
+        probe_timeout = aiohttp.ClientTimeout(total=10)
         
         try:
             # 1. Intentar HEAD request
-            async with session.head(self.url, headers=headers, allow_redirects=True, timeout=10) as resp:
+            async with session.head(self.url, headers=headers, allow_redirects=True, timeout=probe_timeout) as resp:
                 if resp.status == 200:
                     self._parse_headers(resp)
                     return True
+        except (aiohttp.ClientConnectorError, aiohttp.InvalidURL) as e:
+            self.error_message = f"Error al conectar con la URL: {str(e)}"
+            return False
         except Exception:
             pass
 
@@ -151,7 +155,7 @@ class DownloadTask:
         try:
             get_headers = headers.copy()
             get_headers["Range"] = "bytes=0-0"
-            async with session.get(self.url, headers=get_headers, allow_redirects=True, timeout=10) as resp:
+            async with session.get(self.url, headers=get_headers, allow_redirects=True, timeout=probe_timeout) as resp:
                 if resp.status in (200, 206):
                     self._parse_headers(resp)
                     if resp.status == 206:

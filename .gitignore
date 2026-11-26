@@ -17,7 +17,6 @@ develop-eggs/
 dist/
 downloads/
 Descargas/
-downloads/
 *.aether.json
 eggs/
 .eggs/
@@ -69,6 +68,8 @@ venv.bak/
 .DS_Store
 Thumbs.db
 
-# Superpowers isolated worktrees & SDD scratch
+# Local tooling & scratch
 .worktrees/
 .superpowers/
+.skills/
+docs/superpowers/

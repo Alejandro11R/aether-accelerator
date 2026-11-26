@@ -112,12 +112,6 @@ aether-accelerator/
 │   └── workflows/
 │       ├── ci.yml                    # Testeo automático en Linux, Windows y macOS
 │       └── release.yml               # Generación y compilación de binarios multiplataforma
-├── .skills/                          # Skills de ingeniería locales del proyecto
-│   ├── tortugas-ninja/SKILL.md       # Clan Tortugas Ninja & Maestro Splinter
-│   ├── frontend-design/SKILL.md      # Principios estéticos anti-genéricos
-│   ├── impeccable-design/SKILL.md    # Diales y auditoría visual de componentes
-│   ├── high-end-visual-design/SKILL.md # Glassmorphism estricto
-│   └── ui-taste/SKILL.md             # Contraste y consistencia tipográfica
 ├── core/
 │   ├── segment.py                    # Modelo matemático de hilos y cálculo de rangos
 │   ├── engine.py                     # Motor asíncrono y particionado dinámico de chunks

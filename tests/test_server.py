@@ -18,6 +18,7 @@ from aiohttp.test_utils import AioHTTPTestCase
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import run
 import server.app as server_app
 from core.manager import QueueManager
 from core.security import validate_output_dir
@@ -1071,6 +1072,40 @@ class TestCrossPlatformSystemHelpers(unittest.TestCase):
         ) as mock_startfile:
             server_app._open_folder_native(target)
         mock_startfile.assert_called_once_with(target)
+
+
+class TestLauncherConsoleSafety(unittest.TestCase):
+    def test_configure_console_output_reconfigures_and_ignores_errors(self):
+        class _GoodStream:
+            def __init__(self):
+                self.calls = []
+
+            def reconfigure(self, **kwargs):
+                self.calls.append(kwargs)
+
+        class _BrokenStream:
+            def __init__(self, exc):
+                self._exc = exc
+
+            def reconfigure(self, **kwargs):
+                raise self._exc
+
+        good_out = _GoodStream()
+        good_err = _GoodStream()
+        with patch.object(run.sys, "stdout", good_out), patch.object(run.sys, "stderr", good_err):
+            run._configure_console_output()
+        self.assertEqual(good_out.calls, [{"encoding": "utf-8", "errors": "replace"}])
+        self.assertEqual(good_err.calls, [{"encoding": "utf-8", "errors": "replace"}])
+
+        with patch.object(run.sys, "stdout", None), patch.object(
+            run.sys, "stderr", _BrokenStream(OSError("unsupported"))
+        ):
+            run._configure_console_output()
+
+        with patch.object(run.sys, "stdout", _BrokenStream(ValueError("invalid"))), patch.object(
+            run.sys, "stderr", object()
+        ):
+            run._configure_console_output()
 
 
 if __name__ == "__main__":

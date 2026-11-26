@@ -124,7 +124,19 @@ def open_standalone_window(url: str) -> bool:
 
     return False
 
+
+def _configure_console_output() -> None:
+    """Configura stdout/stderr en UTF-8 con reemplazo seguro en consolas Windows."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None and hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
+
+
 def main():
+    _configure_console_output()
     parser = argparse.ArgumentParser(description="Aether Download Accelerator — Multiplatform")
     parser.add_argument("--port", type=int, default=8765, help="Puerto del servidor (default: 8765)")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host (default: 127.0.0.1)")
@@ -148,7 +160,7 @@ def main():
     print(f"\033[1;32m✔ Motor Iniciado:\033[0m http://{args.host}:{args.port}")
     print(f"\033[1;34m📁 Carpeta de Descargas:\033[0m {download_dir}")
     print(f"\033[1;35m⚡ Algoritmo:\033[0m Segmentación dinámica (1 a 32 conexiones concurrentes)")
-    print(f"\033[1;36m🎨 Interfaz:\033[0m Glassmorphism con 3 Dial Modes (Obsidian, Cyber, OLED)\n")
+    print(f"\033[1;36m🎨 Interfaz:\033[0m Static-Glass con 3 temas (Obsidian, Cyber, Frost)\n")
 
     url = f"http://{args.host}:{args.port}"
     if not args.no_browser:
